@@ -3,10 +3,11 @@ import json
 import re
 import pandas as pd
 import numpy as np
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Tuple
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 from datetime import datetime
+from urllib.parse import urlparse
 
 # --- 1. HELPER FUNCTIONS ---
 
@@ -22,6 +23,91 @@ def is_vendor_file(file_path: str) -> bool:
         r"javax?\.", r"sun\.reflect\."
     ]
     return any(re.search(p, file_path) for p in vendor_patterns)
+
+def extract_error_type(error_message: str) -> str:
+    """Extract error type from error message (e.g., TypeError, Error, ReferenceError)"""
+    if not error_message:
+        return "Unknown"
+    # Common JS error types
+    error_patterns = [
+        r'^(TypeError|ReferenceError|SyntaxError|RangeError|URIError|EvalError|Error):',
+        r'^(TypeError|ReferenceError|SyntaxError|RangeError|URIError|EvalError|Error)\b',
+        r'(TypeError|ReferenceError|SyntaxError|RangeError|URIError|EvalError):'
+    ]
+    for pattern in error_patterns:
+        match = re.search(pattern, error_message, re.IGNORECASE)
+        if match:
+            return match.group(1)
+    # Check for common error indicators
+    if 'undefined is not' in error_message or 'null is not' in error_message:
+        return "TypeError"
+    if 'is not defined' in error_message:
+        return "ReferenceError"
+    return "Error"
+
+def extract_route(url: str) -> str:
+    """Extract route/path from URL"""
+    if not url:
+        return "/"
+    try:
+        parsed = urlparse(url)
+        path = parsed.path or "/"
+        # Remove common prefixes and clean up
+        path = re.sub(r'^/v/c/\d+', '', path)  # Veoci-specific cleanup
+        return path if path else "/"
+    except:
+        return "/"
+
+def parse_browser_info(browser: str, ua_string: str) -> Dict[str, Any]:
+    """Parse browser/client information"""
+    result = {
+        'browser_family': None,
+        'browser_version': None,
+        'is_mobile': False
+    }
+    
+    if browser:
+        # Parse browser like "Mobile Safari UI/WKWebView 18.2"
+        match = re.match(r'^(.+?)\s+([\d.]+)?$', browser)
+        if match:
+            result['browser_family'] = match.group(1).strip()
+            result['browser_version'] = match.group(2)
+        else:
+            result['browser_family'] = browser
+    
+    # Check for mobile indicators
+    mobile_indicators = ['Mobile', 'Safari UI', 'WKWebView', 'iOS', 'Android']
+    if browser and any(ind in browser for ind in mobile_indicators):
+        result['is_mobile'] = True
+    if ua_string and any(ind in ua_string for ind in mobile_indicators):
+        result['is_mobile'] = True
+        
+    return result
+
+def normalize_environment(release_stage: str, app_type: str) -> str:
+    """Normalize environment string (e.g., PROD-MOBILE)"""
+    env_parts = []
+    
+    if release_stage:
+        stage = release_stage.upper()
+        if 'PROD' in stage or 'PRODUCTION' in stage:
+            env_parts.append('PROD')
+        elif 'STAG' in stage:
+            env_parts.append('STAGING')
+        elif 'DEV' in stage:
+            env_parts.append('DEV')
+        else:
+            env_parts.append(stage)
+    
+    if app_type:
+        if 'mobile' in app_type.lower():
+            env_parts.append('MOBILE')
+        elif 'client' in app_type.lower():
+            env_parts.append('WEB')
+        elif 'api' in app_type.lower():
+            env_parts.append('API')
+            
+    return '-'.join(env_parts) if env_parts else None
 
 def parse_stack_frames(input_str: Any) -> List[Dict[str, Any]]:
     if not input_str or not isinstance(input_str, str): return []
@@ -81,18 +167,55 @@ def normalize_veoci_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
         field = values.get(key, {})
         if not field: return None
         val = field.get('data', {}).get('value')
-        if isinstance(val, list): return ", ".join(val) # Handle multi-value
+        if isinstance(val, list): return ", ".join(str(v) for v in val) # Handle multi-value
         return val
+
+    error_message = get_val('5')
+    release_stage = get_val('25')
+    app_type = get_val('26')
+    browser = get_val('16')
+    ua_string = get_val('13')
+    request_url = get_val('39')
+    stack_trace = get_val('8')
+    
+    # Parse browser info
+    browser_info = parse_browser_info(browser, ua_string)
+    
+    # Get top frame from stack
+    stack_frames = parse_stack_frames(stack_trace)
+    top_frame = None
+    if stack_frames:
+        tf = stack_frames[0]
+        top_frame = f"{tf['file'].replace('.js', '')}:{tf['line']}" if tf.get('line') else tf['file'].replace('.js', '')
+    
+    # Calculate stack overlap info
+    stack_files = [f['file'] for f in stack_frames if not f.get('vendor')][:5]
 
     return {
         'entry_id': str(entry.get('id')),
-        'project': get_val('21'),          # Project ID
-        'release_stage': get_val('25'),    # Release Stage
+        'project': get_val('21'),          # Bugsnag Project ID
+        'release_stage': release_stage,    # Release Stage
         'app_version': get_val('18'),      # App Version
-        'timestamp': entry.get('lastModified'), # Using lastModified as timestamp
-        'error_message': get_val('5'),     # Error message
-        'stack_frames': parse_stack_frames(get_val('8')), # Stack trace
-        'name': entry.get('name')          # Keep name for reference
+        'app_type': app_type,              # App Type (client type)
+        'timestamp': entry.get('lastModified'),
+        'error_message': error_message,    # Error message
+        'error_type': extract_error_type(error_message),  # Error type
+        'stack_frames': stack_frames,      # Full stack trace
+        'stack_files': stack_files,        # Non-vendor file names for comparison
+        'top_frame': top_frame,            # Top frame string
+        'name': entry.get('name'),
+        # New fields
+        'browser': browser,
+        'browser_family': browser_info['browser_family'],
+        'browser_version': browser_info['browser_version'],
+        'is_mobile': browser_info['is_mobile'],
+        'os_name': get_val('15'),
+        'request_url': request_url,
+        'route': extract_route(request_url),
+        'environment': normalize_environment(release_stage, app_type),
+        'linked_tickets': get_val('24'),   # Linked Veoci Tickets
+        'bugsnag_url': get_val('0'),       # Bugsnag URL
+        'error_url': get_val('6')          # Error URL
     }
 
 def normalize_incoming_entry(entry_wrapper: Any) -> Dict[str, Any]:
@@ -106,15 +229,52 @@ def normalize_incoming_entry(entry_wrapper: Any) -> Dict[str, Any]:
         # Fallback if passed directly as the body dict
         entry = entry_wrapper
 
+    error_message = entry.get('5')
+    release_stage = entry.get('25')
+    app_type = entry.get('26')
+    browser = entry.get('16')
+    ua_string = entry.get('13')
+    request_url = entry.get('39')
+    stack_trace = entry.get('8')
+    
+    # Parse browser info
+    browser_info = parse_browser_info(browser, ua_string)
+    
+    # Get top frame from stack
+    stack_frames = parse_stack_frames(stack_trace)
+    top_frame = None
+    if stack_frames:
+        tf = stack_frames[0]
+        top_frame = f"{tf['file'].replace('.js', '')}:{tf['line']}" if tf.get('line') else tf['file'].replace('.js', '')
+    
+    # Calculate stack overlap info
+    stack_files = [f['file'] for f in stack_frames if not f.get('vendor')][:5]
+
     return {
         'entry_id': str(entry.get('id')),
         'project': entry.get('21'),
-        'release_stage': entry.get('25'),
+        'release_stage': release_stage,
         'app_version': entry.get('18'),
+        'app_type': app_type,
         'timestamp': entry.get('lastModified'),
-        'error_message': entry.get('5'),
-        'stack_frames': parse_stack_frames(entry.get('8')),
-        'name': entry.get('name')
+        'error_message': error_message,
+        'error_type': extract_error_type(error_message),
+        'stack_frames': stack_frames,
+        'stack_files': stack_files,
+        'top_frame': top_frame,
+        'name': entry.get('name'),
+        # New fields
+        'browser': browser,
+        'browser_family': browser_info['browser_family'],
+        'browser_version': browser_info['browser_version'],
+        'is_mobile': browser_info['is_mobile'],
+        'os_name': entry.get('15'),
+        'request_url': request_url,
+        'route': extract_route(request_url),
+        'environment': normalize_environment(release_stage, app_type),
+        'linked_tickets': entry.get('24'),
+        'bugsnag_url': entry.get('0'),
+        'error_url': entry.get('6')
     }
 
 # --- 3. HARD GATES ---
@@ -132,13 +292,19 @@ def passes_hard_gates(incoming: Dict[str, Any], candidate: Dict[str, Any]) -> tu
 
 # --- 4. SCORING LOGIC ---
 
-def calculate_stack_score(incoming_frames: List[Dict], candidate_frames: List[Dict]) -> Dict[str, Any]:
+def calculate_stack_score(incoming: Dict, candidate: Dict) -> Dict[str, Any]:
+    """Enhanced stack trace comparison with overlap percentage"""
     score = 0
     reasons = []
+    signals = []
+    stack_overlap = 0
+    
+    incoming_frames = incoming.get('stack_frames', [])
+    candidate_frames = candidate.get('stack_frames', [])
     
     def select_frames(frames):
-        non_vendor = [f for f in frames if not f['vendor']]
-        vendor = [f for f in frames if f['vendor']]
+        non_vendor = [f for f in frames if not f.get('vendor')]
+        vendor = [f for f in frames if f.get('vendor')]
         chosen = non_vendor if non_vendor else vendor
         unique = []
         seen = set()
@@ -146,134 +312,288 @@ def calculate_stack_score(incoming_frames: List[Dict], candidate_frames: List[Di
             if f['file'] not in seen:
                 seen.add(f['file'])
                 unique.append(f)
-            if len(unique) >= (3 if non_vendor else 2): break
+            if len(unique) >= 5: break
         return unique
 
     inc_frames = select_frames(incoming_frames)
     cand_frames = select_frames(candidate_frames)
+    
+    # Calculate overlap percentage
+    if inc_frames and cand_frames:
+        inc_files = set(f['file'] for f in inc_frames)
+        cand_files = set(f['file'] for f in cand_frames)
+        common = inc_files.intersection(cand_files)
+        if inc_files or cand_files:
+            stack_overlap = round(len(common) / max(len(inc_files), len(cand_files)) * 100, 1)
+    
     matched_files = set()
     
+    # Top frame match (most important)
     if inc_frames and cand_frames:
         if inc_frames[0]['file'] == cand_frames[0]['file']:
-            score += 25
-            reasons.append(f"Top frame match: {inc_frames[0]['file']}")
+            score += 20
+            top_file = inc_frames[0]['file'].replace('.js', '')
+            reasons.append(f"Top frame ({top_file}) matches")
+            signals.append('top_frame')
             matched_files.add(inc_frames[0]['file'])
+            
+            # Line number match bonus
+            if inc_frames[0].get('line') and cand_frames[0].get('line'):
+                if inc_frames[0]['line'] == cand_frames[0]['line']:
+                    score += 5
+                    reasons.append("Exact line number match")
+        
+        # Secondary frame match
         if len(inc_frames) > 1 and len(cand_frames) > 1:
             if inc_frames[1]['file'] == cand_frames[1]['file']:
                 score += 10
                 reasons.append(f"Secondary frame match: {inc_frames[1]['file']}")
                 matched_files.add(inc_frames[1]['file'])
-        for f in inc_frames:
-            for cf in cand_frames:
-                if f['file'] == cf['file'] and f['file'] not in matched_files:
-                    score += 5
-                    reasons.append(f"Frame overlap: {f['file']}")
-                    matched_files.add(f['file'])
+        
+        # Stack overlap bonus
+        if stack_overlap >= 80:
+            score += 15
+            signals.append('stack')
+            reasons.append(f"High stack similarity ({stack_overlap}%)")
+        elif stack_overlap >= 50:
+            score += 8
+            signals.append('stack')
+            reasons.append(f"Moderate stack similarity ({stack_overlap}%)")
+        elif stack_overlap > 0:
+            score += 3
+            reasons.append(f"Some stack overlap ({stack_overlap}%)")
 
-    return {"score": min(score, 40), "reasons": reasons}
+    return {
+        "score": min(score, 50),
+        "reasons": reasons,
+        "signals": signals,
+        "stack_overlap": stack_overlap,
+        "top_frame": incoming.get('top_frame')
+    }
 
-def calculate_time_score(incoming_ts: str, candidate_ts: str) -> Dict[str, Any]:
+def calculate_message_score(message_similarity: float) -> Dict[str, Any]:
+    """Score based on error message similarity"""
+    signals = []
+    reasons = []
+    
+    # Scale TF-IDF similarity (0-1) to score contribution
+    if message_similarity >= 0.9:
+        score = 20
+        reasons.append("Identical normalized message")
+        signals.append('message')
+    elif message_similarity >= 0.7:
+        score = 15
+        reasons.append(f"Message highly similar ({message_similarity:.0%})")
+        signals.append('message')
+    elif message_similarity >= 0.4:
+        score = 8
+        reasons.append(f"Message moderately similar ({message_similarity:.0%})")
+        signals.append('message')
+    else:
+        score = message_similarity * 10  # 0-4 points
+        if message_similarity > 0.1:
+            reasons.append(f"Message slightly similar ({message_similarity:.0%})")
+    
+    return {"score": score, "reasons": reasons, "signals": signals}
+
+def calculate_environment_score(incoming: Dict, candidate: Dict) -> Dict[str, Any]:
+    """Score based on environment, client, and route matching"""
     score = 0
     reasons = []
+    signals = []
+    
+    # Environment match (e.g., PROD-MOBILE)
+    if incoming.get('environment') and candidate.get('environment'):
+        if incoming['environment'] == candidate['environment']:
+            score += 10
+            reasons.append(f"Same environment ({incoming['environment']})")
+            signals.append('env')
+    
+    # Route/URL match
+    if incoming.get('route') and candidate.get('route'):
+        if incoming['route'] == candidate['route']:
+            score += 8
+            reasons.append(f"Exact route match ({incoming['route']})")
+            signals.append('url')
+        elif incoming['route'] != '/' and candidate['route'] != '/':
+            # Partial route match
+            inc_parts = incoming['route'].strip('/').split('/')
+            cand_parts = candidate['route'].strip('/').split('/')
+            if inc_parts and cand_parts and inc_parts[0] == cand_parts[0]:
+                score += 3
+                reasons.append("Route prefix match")
+    
+    # Client/Browser match
+    if incoming.get('browser_family') and candidate.get('browser_family'):
+        if incoming['browser_family'] == candidate['browser_family']:
+            if incoming.get('browser_version') == candidate.get('browser_version'):
+                score += 5
+                reasons.append(f"Same client family and major version ({incoming['browser_family']} {incoming['browser_version']})")
+            else:
+                score += 3
+                reasons.append(f"Same client family ({incoming['browser_family']}), different version")
+            signals.append('client')
+    
+    # App type match
+    if incoming.get('app_type') and candidate.get('app_type'):
+        if incoming['app_type'] == candidate['app_type']:
+            score += 3
+            reasons.append(f"Same app type ({incoming['app_type']})")
+    
+    return {"score": min(score, 25), "reasons": reasons, "signals": signals}
+
+def calculate_temporal_score(incoming: Dict, candidate: Dict) -> Dict[str, Any]:
+    """Score based on time proximity"""
+    score = 0
+    reasons = []
+    signals = []
+    
+    incoming_ts = incoming.get('timestamp')
+    candidate_ts = candidate.get('timestamp')
+    
     if incoming_ts and candidate_ts:
         try:
-            dt_inc = pd.to_datetime(incoming_ts)
-            dt_cand = pd.to_datetime(candidate_ts)
-            days_diff = abs((dt_inc - dt_cand).days)
-            if days_diff <= 7:
+            dt_inc = pd.to_datetime(incoming_ts, unit='ms')
+            dt_cand = pd.to_datetime(candidate_ts, unit='ms')
+            hours_diff = abs((dt_inc - dt_cand).total_seconds() / 3600)
+            days_diff = hours_diff / 24
+            
+            if hours_diff <= 72:  # Within 72 hours
                 score += 5
-                reasons.append("Recent (<= 7 days)")
-            if days_diff > 180: score -= 15
-            elif days_diff > 90: score -= 8
+                reasons.append("Temporal proximity: within 72 hours")
+                signals.append('temporal')
+            elif days_diff <= 7:
+                score += 3
+                reasons.append("Temporal proximity: within 7 days")
+                signals.append('temporal')
+            elif days_diff > 180:
+                score -= 10
+                reasons.append("Temporal distance: over 180 days")
+            elif days_diff > 90:
+                score -= 5
+                reasons.append("Temporal proximity: over 90 days")
         except:
             pass
-    return {"score": score, "reasons": reasons}
-
-def calculate_context_score(incoming: Dict, candidate: Dict) -> Dict[str, Any]:
-    score = 0
-    reasons = []
-    if incoming['project'] and candidate['project'] and incoming['project'] == candidate['project']:
-        score += 15
-        reasons.append("Same Project")
-    if incoming['app_version'] and candidate['app_version'] and incoming['app_version'] == candidate['app_version']:
-        score += 10
-        reasons.append("Same App Version")
-    if incoming['release_stage'] and candidate['release_stage'] and incoming['release_stage'] == candidate['release_stage']:
-        score += 5
-        reasons.append("Same Release Stage")
-    return {"score": score, "reasons": reasons}
+    
+    return {"score": score, "reasons": reasons, "signals": signals}
 
 def calculate_total_score(incoming: Dict[str, Any], candidate: Dict[str, Any], message_similarity: float = 0.0) -> Dict[str, Any]:
-    stack_res = calculate_stack_score(incoming['stack_frames'], candidate['stack_frames'])
-    stack_score = stack_res['score']
+    """
+    Calculate total similarity score with all signals.
+    Max score: 100 (stack: 50, message: 20, env: 25, temporal: 5)
+    """
+    # Calculate individual scores
+    stack_res = calculate_stack_score(incoming, candidate)
+    message_res = calculate_message_score(message_similarity)
+    env_res = calculate_environment_score(incoming, candidate)
+    temporal_res = calculate_temporal_score(incoming, candidate)
     
-    message_score_scaled = message_similarity * 30
-    
-    context_res = calculate_context_score(incoming, candidate)
-    context_score = context_res['score']
-    
-    time_res = calculate_time_score(incoming['timestamp'], candidate['timestamp'])
-    time_score = time_res['score']
-    
-    total_score = stack_score + message_score_scaled + context_score + time_score
+    # Sum scores
+    total_score = (
+        stack_res['score'] + 
+        message_res['score'] + 
+        env_res['score'] + 
+        temporal_res['score']
+    )
     final_score = max(0, min(total_score, 100))
+    
+    # Collect all signals and reasons
+    all_signals = (
+        stack_res.get('signals', []) + 
+        message_res.get('signals', []) + 
+        env_res.get('signals', []) + 
+        temporal_res.get('signals', [])
+    )
     
     all_reasons = (
         stack_res['reasons'] + 
-        [f"Message similarity: {message_similarity:.2f}"] + 
-        context_res['reasons'] + 
-        time_res['reasons']
+        message_res['reasons'] + 
+        env_res['reasons'] + 
+        temporal_res['reasons']
     )
     
     return {
         "entry_id": candidate['entry_id'],
         "name": candidate['name'],
         "final_score": final_score,
+        "signals": list(set(all_signals)),  # Unique signals
         "scores": {
-            "stack": stack_score,
-            "message": message_similarity,
-            "context": context_score,
-            "time": time_score
+            "stack": stack_res['score'],
+            "message": round(message_similarity, 2),
+            "environment": env_res['score'],
+            "temporal": temporal_res['score']
         },
-        "reasons": all_reasons
+        "reasons": all_reasons,
+        # Additional metadata for display
+        "top_frame": candidate.get('top_frame'),
+        "stack_overlap": stack_res.get('stack_overlap', 0),
+        "error_type": candidate.get('error_type'),
+        "route": candidate.get('route'),
+        "environment": candidate.get('environment'),
+        "linked_tickets": candidate.get('linked_tickets')
     }
 
-def generate_triage_report(results: List[Dict[str, Any]], total_candidates: int) -> Dict[str, Any]:
+def generate_triage_report(results: List[Dict[str, Any]], total_candidates: int, min_score: int = 0) -> Dict[str, Any]:
     """
     Generates a report similar to the Bugsnag Triage Agent's output.
+    Includes all metadata for rich HTML rendering.
+    
+    Confidence thresholds (adjusted for better match quality):
+    - High: score >= 70 (was 85)
+    - Medium: score >= 50 (was 70)  
+    - Low: score >= 30
+    - Below 30: filtered out by default
     """
+    # Filter results by minimum score threshold
+    filtered_results = [r for r in results if r['final_score'] >= min_score]
+    
     report = {
         "batchSummary": {
             "totalAnalyzed": total_candidates,
-            "relatedFound": len(results),
+            "relatedFound": len(filtered_results),
             "confidenceCounts": {"High": 0, "Medium": 0, "Low": 0}
         },
         "relatedEntries": []
     }
     
-    for res in results:
-        # Map 0-100 score to Confidence
+    for res in filtered_results:
         score = res['final_score']
-        if score >= 85: confidence = "High"
-        elif score >= 70: confidence = "Medium"
-        else: confidence = "Low"
+        
+        # Adjusted confidence thresholds
+        if score >= 70:
+            confidence = "High"
+        elif score >= 50:
+            confidence = "Medium"
+        else:
+            confidence = "Low"
         
         report["batchSummary"]["confidenceCounts"][confidence] += 1
         
-        # Generate Explanation from Reasons
-        explanation = f"Match found with {confidence} confidence ({score:.1f}/100). "
-        explanation += "Key signals: " + "; ".join(res['reasons'][:3]) + "."
+        # Generate detailed explanation from reasons
+        reasons_str = "; ".join(res['reasons'][:4]) if res['reasons'] else "General similarity detected"
+        explanation = f"{reasons_str}."
         
         entry = {
             "entryId": res['entry_id'],
-            "score": score / 100.0, # Normalize to 0-1 for compatibility
+            "name": res.get('name'),
+            "score": round(score / 100.0, 2),  # Normalize to 0-1
             "confidence": confidence,
-            "signals": list(res['scores'].keys()),
+            "signals": res.get('signals', []),
             "explanation": explanation,
-            "breakdown": res['scores']
+            "breakdown": res['scores'],
+            # Rich metadata for display
+            "topFrame": res.get('top_frame'),
+            "stackOverlap": res.get('stack_overlap', 0),
+            "errorType": res.get('error_type'),
+            "route": res.get('route'),
+            "environment": res.get('environment'),
+            "linkedTickets": res.get('linked_tickets')
         }
         report["relatedEntries"].append(entry)
-        
+    
+    # Limit to top 20 matches to keep response manageable
+    report["relatedEntries"] = report["relatedEntries"][:20]
+    
     return report
 
 # --- 5. MAIN PIPELINE ---
