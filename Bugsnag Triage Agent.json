@@ -1,0 +1,956 @@
+{
+  "name": "Bugsnag Triage Agent",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "bugsnag-triage",
+        "options": {}
+      },
+      "id": "80373083-40ab-46be-9e7a-57e10ddf3ff2",
+      "name": "Webhook - Receive Veoci Entry",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [
+        -2640,
+        480
+      ],
+      "webhookId": "{{ $randomString(32) }}"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Normalize the incoming entry to match the form entries structure for consistent AI processing\n\nconst inputData = $input.first()?.json;\nlet originalEntry = inputData?.originalEntry;\nlet dataSource = inputData?.viewKeyCalculation?.dataSource || 'unknown';\n\n// Vendor detection helper\nfunction isVendorFile(file) {\n  if (!file) return false;\n  const vendorPatterns = [\n    // JavaScript/browser/vendor libs\n    /^node_modules\\//,\n    /^@vue\\//,\n    /vuetify\\//,\n    /core-js/,\n    /zone\\.js/,\n    /runtime-core\\.esm-bundler\\.js/,\n    /reactivity\\.esm-bundler\\.js/,\n    /proxiedModel\\.mjs/,\n    /app\\..*\\.js/,\n    /vendor\\..*\\.js/,\n    /chunk-.*\\.js/,\n\n    // Java + Spring + Logback logging infra\n    /LogbackBugsnagAppender\\.java/,\n    /AppenderBase\\.java/,\n    /AppenderAttachableImpl\\.java/,\n    /Logger\\.java/,\n    /ch\\.qos\\.logback\\./,\n    /org\\.springframework\\./,\n    /org\\.apache\\.commons\\./,\n    /java\\.util\\./,\n    /javax?\\./,\n    /sun\\.reflect\\./\n  ];\n  return vendorPatterns.some(p => p.test(file));\n}\n\nfunction parseStackFrames(input) {\n  if (!input || typeof input !== 'string') return [];\n\n  const frames = [];\n  const seen = new Set();\n\n  // Case 1: HTML <strong>…</strong>\n  const htmlRegex = /<strong>(.*?)<\\/strong>/g;\n  let match;\n  while ((match = htmlRegex.exec(input)) !== null) {\n    const raw = match[1].trim();\n    if (seen.has(raw)) continue;\n    seen.add(raw);\n\n    // Support file:line - codeSnippet\n    const parts = raw.split(' - ');\n    const fileLine = parts[0];\n    const codeSnippet = parts[1] || null;\n\n    const [filePart, lineStr] = fileLine.split(':');\n    const line = lineStr ? parseInt(lineStr, 10) : null;\n    const fileName = filePart ? filePart.split('/').pop() : null;\n\n    frames.push({ \n      file: fileName, \n      line, \n      vendor: isVendorFile(filePart), \n      code: codeSnippet \n    });\n  }\n\n  // Case 2: Plain text *.js, *.vue, *.ts, etc. (with optional \" - code\" part)\n  const plainRegex = /([\\w@:\\/.\\-]+?\\.(vue|js|ts|mjs|jsx|tsx|java)):(\\d+)(?:\\s*-\\s*([\\w.$<>]+))?/g;\n  while ((match = plainRegex.exec(input)) !== null) {\n    const raw = match[0].trim();\n    if (seen.has(raw)) continue;\n    seen.add(raw);\n\n    const filePath = match[1];\n    const fileName = filePath.split('/').pop();\n    const line = parseInt(match[3], 10);\n    const codeSnippet = match[4] || null;\n\n    frames.push({ \n      file: fileName, \n      line, \n      vendor: isVendorFile(filePath), \n      code: codeSnippet \n    });\n  }\n\n  // Case 3: global code / bare line numbers\n  const specialRegex = /(global code)(?::(\\d+))|(?<!\\w):(\\d+)/gi;\n  while ((match = specialRegex.exec(input)) !== null) {\n    const raw = match[0].trim();\n    if (seen.has(raw)) continue;\n    seen.add(raw);\n\n    if (match[1]) {\n      frames.push({\n        file: \"global code\",\n        line: parseInt(match[2], 10),\n        vendor: true,\n        code: null\n      });\n    } else if (match[3]) {\n      frames.push({\n        file: null,\n        line: parseInt(match[3], 10),\n        vendor: true,\n        code: null\n      });\n    }\n  }\n\n  return frames;\n}\n\n// Helper: strip HTML tags\nfunction stripHtml(htmlString) {\n  if (!htmlString || typeof htmlString !== 'string') return htmlString;\n  return htmlString\n    .replace(/<[^>]*>/g, '')\n    .replace(/&amp;/g, '&')\n    .replace(/&lt;/g, '<')\n    .replace(/&gt;/g, '>')\n    .replace(/&quot;/g, '\"')\n    .replace(/&#39;/g, \"'\")\n    .replace(/&nbsp;/g, ' ')\n    .trim();\n}\n\nif (!originalEntry) {\n  try {\n    const webhookData = $('Webhook - Receive Veoci Entry').first().json.body;\n    if (webhookData) {\n      originalEntry = webhookData;\n      dataSource = 'webhook_flattened';\n    }\n  } catch {}\n  if (!originalEntry) {\n    try {\n      const sampleData = $('Sample Data Injector').first().json;\n      if (sampleData?.values) {\n        originalEntry = sampleData;\n        dataSource = 'manual_trigger';\n      }\n    } catch {}\n  }\n}\n\nif (!originalEntry) {\n  return [{ json: { error: 'No original entry data available' } }];\n}\n\nlet normalizedEntry;\nif (dataSource === 'webhook_flattened') {\n  normalizedEntry = {\n    entryId: originalEntry?.id,\n    formId: originalEntry?.formId,\n    containerId: originalEntry?.containerId,\n    name: originalEntry?.name,\n    lastModified: originalEntry?.lastModified,\n    created: originalEntry?.created,\n    '5': originalEntry?.['5'],\n    '6': originalEntry?.['6'],\n    '8': parseStackFrames(originalEntry?.['8'] || ''),  // now includes vendor info\n    '16': originalEntry?.['16'],\n    '18': originalEntry?.['18'],\n    '21': originalEntry?.['21'],\n    '24': originalEntry?.['24'] || [],\n    '25': originalEntry?.['25'],\n    '26': originalEntry?.['26'],\n    '27': originalEntry?.['27']\n  };\n  if (originalEntry?.container) {\n    normalizedEntry.containerName = originalEntry.container.name;\n    normalizedEntry.containerId = originalEntry.container.id;\n  }\n} else {\n  normalizedEntry = {\n    entryId: originalEntry?.id,\n    formId: originalEntry?.formId,\n    containerId: originalEntry?.containerId,\n    name: originalEntry?.name,\n    lastModified: originalEntry?.lastModified,\n    created: originalEntry?.created,\n    '5': originalEntry?.values?.['5']?.data?.value,\n    '6': originalEntry?.values?.['6']?.data?.value,\n    '8': parseStackFrames(originalEntry?.values?.['8']?.data?.value || ''), // includes vendor info\n    '16': originalEntry?.values?.['16']?.data?.value,\n    '18': originalEntry?.values?.['18']?.data?.value,\n    '21': originalEntry?.values?.['21']?.data?.value,\n    '24': originalEntry?.values?.['24']?.data?.value || [],\n    '25': originalEntry?.values?.['25']?.data?.value,\n    '26': originalEntry?.values?.['26']?.data?.value,\n    '27': originalEntry?.values?.['27']?.data?.value\n  };\n  if (originalEntry?.container) {\n    normalizedEntry.containerName = originalEntry.container.name;\n    normalizedEntry.containerId = originalEntry.container.id;\n  }\n}\n\nreturn [{ json: normalizedEntry }];\n"
+      },
+      "id": "c9e2c267-4785-4a17-8b71-b1a88d57093a",
+      "name": "Normalize Incoming Entry",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -2432,
+        480
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Process the API response from Veoci and prepare simplified data for AI analysis\nconst response = $input.first()?.json;\n\n// Get the normalized incoming entry from the response (passed through from Normalize Incoming Entry)\nconst normalizedIncomingEntry = $('Normalize Incoming Entry').first().json;\n\nconsole.log('API Response structure check:');\nconsole.log('- Response type:', typeof response);\nconsole.log('- Has entries array:', Array.isArray(response?.entries));\nconsole.log('- Entry count from API:', response?.entryCount);\nconsole.log('- Current entry count:', response?.currentEntryCount);\n\n// Extract entries from the nested API response structure\nconst entries = response?.entries || [];\nconsole.log(`Found ${entries.length} entries from Veoci API`);\n\nif (entries.length > 0) {\n  console.log('Sample entry structure:');\n  console.log('- Entry ID:', entries[0]?.id);\n  console.log('- Entry name:', entries[0]?.name);\n  console.log('- Values keys available:', Object.keys(entries[0]?.values || {}));\n}\n\nconsole.log('Normalized incoming entry available:', !!normalizedIncomingEntry);\nif (!!normalizedIncomingEntry) {\n  console.log('Normalized incoming entry ID:', normalizedIncomingEntry.entryId);\n  console.log('Normalized entry field keys:', Object.keys(normalizedIncomingEntry).filter(k => /^\\d+$/.test(k)));\n}\n\n// ------------------ Helpers ------------------\n\n// Vendor detection helper\nfunction isVendorFile(file) {\n  if (!file) return false;\n  const vendorPatterns = [\n    // JavaScript/browser/vendor libs\n    /^node_modules\\//,\n    /^@vue\\//,\n    /vuetify\\//,\n    /core-js/,\n    /zone\\.js/,\n    /runtime-core\\.esm-bundler\\.js/,\n    /reactivity\\.esm-bundler\\.js/,\n    /proxiedModel\\.mjs/,\n    /app\\..*\\.js/,\n    /vendor\\..*\\.js/,\n    /chunk-.*\\.js/,\n\n    // Java + Spring + Logback logging infra\n    /LogbackBugsnagAppender\\.java/,\n    /AppenderBase\\.java/,\n    /AppenderAttachableImpl\\.java/,\n    /Logger\\.java/,\n    /ch\\.qos\\.logback\\./,\n    /org\\.springframework\\./,\n    /org\\.apache\\.commons\\./,\n    /java\\.util\\./,\n    /javax?\\./,\n    /sun\\.reflect\\./\n  ];\n  return vendorPatterns.some(p => p.test(file));\n}\n\n// Parse raw stack text into structured frames\nfunction parseStackFrames(input) {\n  if (!input || typeof input !== 'string') return [];\n  const frames = [];\n  const seen = new Set();\n\n  // Match file:line - optional code snippet\n  const regex = /([\\w@:\\/.\\-]+?\\.(vue|js|ts|mjs|jsx|tsx|java)):(\\d+)(?:\\s*-\\s*([\\w.$<>]+))?/g;\n  let match;\n  while ((match = regex.exec(input)) !== null) {\n    const raw = match[0].trim();\n    if (seen.has(raw)) continue;\n    seen.add(raw);\n\n    const filePath = match[1];\n    const fileName = filePath.split('/').pop();\n    const line = parseInt(match[3], 10);\n    const codeSnippet = match[4] || null;\n\n    frames.push({\n      file: fileName,\n      line,\n      vendor: isVendorFile(filePath),\n      code: codeSnippet\n    });\n  }\n\n  return frames;\n}\n\n// Strip HTML tags and decode entities\nfunction stripHtml(htmlString) {\n  if (!htmlString || typeof htmlString !== 'string') {\n    return htmlString;\n  }\n  return htmlString\n    .replace(/<[^>]*>/g, '')\n    .replace(/&amp;/g, '&')\n    .replace(/&lt;/g, '<')\n    .replace(/&gt;/g, '>')\n    .replace(/&quot;/g, '\"')\n    .replace(/&#39;/g, \"'\")\n    .replace(/&nbsp;/g, ' ')\n    .trim();\n}\n\n// ------------------ Main Processing ------------------\n\n// Process each entry and extract only entryId and values data using the same format as normalized entry\n// Filter out the incoming entry to avoid self-comparison\nconst simplifiedEntries = entries\n  .filter(entry => entry.id !== normalizedIncomingEntry?.entryId)\n  .map(entry => {\n    const simplified = {\n      entryId: entry.id,\n      formId: entry.formId,\n      name: entry.name,\n      lastModified: entry.lastModified,\n      created: entry.created\n    };\n  \n    if (entry.values) {\n      const essentialFields = ['5', '8', '6', '27', '25', '26', '18', '16', '21', '24'];\n      \n      essentialFields.forEach(key => {\n        if (!entry.values[key]) return;\n        \n        const field = entry.values[key];\n        let value = field?.data?.value;\n\n        // Handle multi-value fields\n        if (field?.data?.valueType === 'MULTI' && Array.isArray(value)) {\n          value = value.join(', ');\n        }\n\n        // Handle stack trace fields (normalize into structured frames)\n        if ((key === '8' || key === '34') && value && typeof value === 'string') {\n          value = stripHtml(value);\n          value = parseStackFrames(value);\n        }\n\n        // Simplify linked tickets\n        if (key === '24' && value && Array.isArray(value)) {\n          value = value.map(ticket => ({\n            id: ticket.id,\n            container: ticket.container?.id,\n            name: ticket.name\n          }));\n        }\n\n        simplified[key] = value;\n      });\n    }\n\n    if (entry.container) {\n      simplified.containerName = entry.container.name;\n      simplified.containerId = entry.container.id;\n    }\n\n    return simplified;\n  })\n  .filter(entry =>\n    entry['5'] || entry['8'] || Object.keys(entry).some(k => /^\\d+$/.test(k))\n  );\n\nconsole.log(`Prepared ${simplifiedEntries.length} simplified entries for AI analysis`);\nif (simplifiedEntries.length > 0) {\n  console.log('Sample processed entry field indices:', \n    Object.keys(simplifiedEntries[0]).filter(k => /^\\d+$/.test(k))\n  );\n}\n\n// Store metadata\nconst staticData = {\n  incomingEntry: normalizedIncomingEntry,\n  totalEntries: entries.length,\n  processedEntries: simplifiedEntries.length,\n  apiMetadata: {\n    entryCount: response?.entryCount,\n    currentEntryCount: response?.currentEntryCount,\n    paged: response?.paged\n  },\n  timestamp: new Date().toISOString(),\n  action: 'prepare_ai_analysis_data'\n};\n\n// Create items for batching\nconst entriesForBatching = simplifiedEntries.map(entry => ({\n  entryData: entry,\n  staticData: staticData\n}));\n\nconsole.log(`Created ${entriesForBatching.length} individual items for batch processing`);\n\nif (simplifiedEntries.length === 0) {\n  return [{ json: { noEntries: true } }];\n}\n\nreturn simplifiedEntries.map(entry => ({ json: entry }));\n"
+      },
+      "id": "95924756-475a-4d9b-93fe-bd3fbf0c2e37",
+      "name": "Prepare Data for AI Analysis",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1872,
+        480
+      ]
+    },
+    {
+      "parameters": {
+        "batchSize": 25,
+        "options": {}
+      },
+      "id": "8bb4bd87-e9e7-45a1-bd23-79eb97ae7c09",
+      "name": "Split Entries Into Batches",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        -1664,
+        480
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Prepare batch data for AI pattern analysis\nconst batchItems = $input.all();\nconsole.log(batchItems)\nconsole.log(`Processing batch of ${batchItems.length} entries`);\n\n// Extract static data from first item (same for all items in this batch)\nconst incomingEntry = $('Normalize Incoming Entry').first().json;\n\n// Extract entry data from all items in this batch except the incoming entry\nconst batchEntries = batchItems\n  .filter(entry => entry.entryId !== incomingEntry?.entryId)\n  .map(entry => entry.json)\n\nconsole.log(`Batch contains ${batchEntries.length} entries for AI analysis`);\nconsole.log(`Incoming entry ID: ${incomingEntry?.entryId || 'unknown'}`);\nconsole.log('Incoming entry structure type: normalized from dedicated node');\n\n// Return data in the same format expected by AI agent\n// Both incoming entry and existing entries now use the same field structure\nreturn {\n  existingEntries: batchEntries,\n};"
+      },
+      "id": "119a1864-6023-4f74-a897-9e7658e3fe77",
+      "name": "Prepare Batch for AI",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1408,
+        560
+      ]
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=You are a technical support expert specializing in error analysis and pattern detection for Bugsnag error reports.\n\n---\n\n## GOAL\nGiven ONE incoming Bugsnag error entry and a LIST of backend-filtered candidate entries, compute relatedness and return the strongest matches. Compare ONLY the incoming entry to EACH candidate (never candidate-to-candidate).\n\n---\n\n## STRICT OUTPUT\nReturn ONLY the final JSON object in the shape under “FINAL JSON”. Do not include commentary.  \nNo guessing: if a value cannot be derived from inputs after normalization, set it to null or the literal \"not available\". Never invent values.\n\n---\n\n## DEBUG MODE\nAlways output a `diagnostics` object FIRST, then the final JSON.  \n`diagnostics` must show:  \n- incoming canonical top frame filename,  \n- candidate canonical top frame filenames,  \n- explicit exclusions by gate (with reasons),  \n- normalized routes/messages,  \n- stack Jaccard values.  \nIf `exclusionsByGate` is empty but any candidate canonical filename differs from the incoming, this is a **fatal error** — the output is invalid.\n\n---\n\n## INPUTS\nIncoming Entry (single):\n<<<INCOMING ENTRY>>>\n{{ JSON.stringify($('Normalize Incoming Entry').first().json) }}\n<<<END INCOMING ENTRY>>>\n\nExisting Entries ({{ $json.existingEntries.length }} total):\n<<<CANDIDATE ENTRIES>>>\n{{ JSON.stringify($json.existingEntries, null, 2) }}\n<<<END CANDIDATE ENTRIES>>>\n\n---\n\n## FIELD MAP\n- message: 5  \n- stack: 8 (array frames: { file, line?, vendor?, code? }, top→bottom)  \n- route/url: 6  \n- errorType: 27  \n- environment: 25  \n- appType: 26  \n- appVersion: 18  \n- client/browser: 16  \n- linked tickets: 24 (verbatim in output)  \n- metadata: entryId, created, lastModified  \n\n---\n\n## VENDOR FRAMES\nAll stack frames are already normalized upstream.  \nEach frame includes a `vendor: true|false` flag based on consistent regex rules (frontend libraries, Vue/React build artifacts, Java/Spring/Logback infra, etc.).  \n\nDownstream logic should **trust this flag** — do not attempt to re-detect vendor frames.  \nIf all frames are marked `vendor: true`, set the top frame to `\"vendorTop\"`.\n\n---\n\n## STACK NORMALIZATION\n- Canonical filename:  \n  1. Extract the FIRST token ending with `.java` / `.js` / `.ts` / `.vue` / `.mjs` / `.jsx` / `.tsx`.  \n  2. Strip any leading `\"Stacktrace\"`.  \n  3. Remove the extension.  \n  4. Lowercase the result.  \n  Example: `SpringUserDAO.java` → `springuserdao`; `SpringFormEntryDAO.java` → `springformentrydao`.  \n- If no such token exists, lowercase the entire `file`.  \n- De-duplicate by canonical filename (keep earliest/topmost).  \n- Infer `vendor` using vendor prefixes above (overrides input flag).  \n- Top frame = first NON-vendor frame; if none, set to `\"vendorTop\"`.  \n- Use `code` for proximity when present; else fallback to filename only.\n\n---\n\n## ROUTE NORMALIZATION\n- If `6` matches `^(GET|POST|PUT|PATCH|DELETE)\\s+(/\\S*)`, keep path; replace numeric IDs and GUID-like tokens with `{id}`; collapse duplicate slashes.  \n- If `6` looks like `*.java:\\d+` → route = `\"not available\"`.  \n- Similarity tiers: exact path match; same base path (IDs stripped); same feature bucket; else none.\n\n---\n\n## MESSAGE NORMALIZATION\n- Lowercase; collapse whitespace; strip standalone integers and GUIDs; trim punctuation.\n- If message matches boilerplate NullPointerException form:\n  `cannot invoke \"<class>.<method>()\" because \"<var>\" is null`\n  → extract `targetClass` and `targetVar` for similarity scoring.\n\n---\n\n## ABSOLUTE RULE\nIf incoming top frame ≠ `\"vendorTop\"`:  \n- Include ONLY candidates whose canonical top-frame filename exactly equals the incoming canonical filename (case-insensitive).  \n- If filenames differ: exclude immediately. Mark under `exclusionsByGate` with reason `\"top-frame filename mismatch\"`.  \n- Do not score or allow fallback inclusion.  \n\nIf incoming top frame = `\"vendorTop\"`, skip this rule.\n\n---\n\n## HARD GATES\n- G0: Skip if candidate.entryId == incoming.entryId.  \n- G2: If candidate top frame = `\"vendorTop\"`, include but cap final score ≤ 0.70 and set top-frame signal = 0.0.\n\n---\n\n## SIGNALS (apply only after Absolute Rule passes)\n1. **Top-frame proximity (0.40)**  \n   - 1.0: same file & same code, |Δline| ≤ 5  \n   - 0.9: same file & same code, |Δline| ≤ 15  \n   - 0.8: same file, different code, |Δline| ≤ 15  \n   - 0.6: same file (line far/unknown/code missing)  \n\n2. **Stack similarity (0.35)**  \n   - Compute Jaccard over NON-vendor frames (canonical filename + code if both have code; else filename).  \n   - +0.10 order bonus if ≥50% of overlapping pairs preserve relative order (cap at 1.0).  \n   - Report `stackOverlap` = Jaccard × 100.\n\n3. **Route similarity (0.08)**  \n   - 1.0 exact path match; 0.7 same base path; 0.4 same feature bucket; else 0.0.\n\n4. **Environment & client (0.08 combined; capped with temporal)**  \n   - Env 0.06: 1.0 if field 25 matches; else 0.0.  \n   - Client 0.02 (field 16): 1.0 same major; 0.5 same family; else 0.0.  \n\n5. **Message similarity (0.09)**\n   - 1.0 exact normalized match.\n   - Else if message matches boilerplate NullPointerException form:\n       * 1.0 if both targetClass and targetVar match.\n       * 0.8 if only targetClass matches.\n       * 0.5 if only targetVar matches.\n       * else 0.0.\n   - Else token-overlap Jaccard, cap 0.4.\n\n6. **Temporal proximity (0.08, conditional)**  \n   - Apply ONLY if (stackSim ≥ 0.6) AND (top-frame proximity ≥ 0.6).  \n   - Use `created` (fallback `lastModified`). Accept ISO or epoch ms.  \n   - ≤24h: 1.0; ≤72h: 0.7; ≤7d: 0.4; else 0.0.  \n   - Combined (env + client + temporal) ≤ 0.12 contribution.\n\n---\n\n## FINAL SCORE\nFinal score = weighted sum after caps.  \nRound floats to 4 decimals. `stackOverlap` = 0–100 with 1 decimal.\n\n---\n\n## FINAL JSON (OUTPUT ONLY)\n{\n  \"diagnostics\": {\n    \"incomingCanonicalTopFrame\": \"<string or 'vendorTop'>\",\n    \"candidateCanonicalTopFrames\": [\"<string>\", ...],\n    \"exclusionsByGate\": [{ \"candidateEntryId\": \"<id>\", \"reason\": \"<text>\" }],\n    \"normalizedRoutes\": { \"incoming\": \"<route>\", \"candidates\": [\"<route>\", ...] },\n    \"normalizedMessages\": { \"incoming\": \"<msg>\", \"candidates\": [\"<msg>\", ...] },\n    \"jaccardValues\": [{ \"candidateEntryId\": \"<id>\", \"jaccard\": <0–1> }]\n  },\n  \"batchNumber\": 1,\n  \"batchSize\": <int candidates>,\n  \"relatedEntries\": [\n    {\n      \"entryId\": \"<id>\",\n      \"score\": <0–1>,\n      \"confidence\": \"High\" | \"Medium\" | \"Low\",\n      \"signals\": [\"top_frame\",\"stack\",\"message\",\"url\",\"env\",\"client\",\"temporal\"],\n      \"explanation\": \"<concise rationale>\",\n      \"topFrame\": \"<incoming canonical file:line or 'vendorTop'>\",\n      \"stackOverlap\": <0–100>,\n      \"errorType\": \"<from 27>\",\n      \"route\": \"<normalized route or 'not available'>\",\n      \"environment\": \"<from 25>\",\n      \"client\": \"<from 16>\",\n      \"24\": <array from field 24 or null>\n    }\n  ],\n  \"batchSummary\": {\n    \"totalAnalyzed\": <int>,\n    \"relatedFound\": <int>,\n    \"confidenceCounts\": { \"High\": <int>, \"Medium\": <int>, \"Low\": <int> },\n    \"patterns\": [\"<brief hints>\"],\n    \"vendorNoiseRatio\": <0–1>\n  },\n  \"crossBatchIndicators\": []\n}\n\n---\n\n## CONFIDENCE\n- High ≥ 0.85  \n- Medium 0.75–0.84  \n- Low 0.60–0.74  \n- Otherwise omit `confidence`.\n\n---\n\n## SANITY CHECKS\n- `topFrame` equals the INCOMING entry’s computed top NON-vendor frame (canonicalized), or `\"vendorTop\"`.  \n- If incoming top frame ≠ `\"vendorTop\"`, every included candidate must share the SAME canonical top-frame filename string.  \n- If candidate top frame = `\"vendorTop\"`, score ≤ 0.70 and top-frame signal = 0.0.  \n- If labeled “identical message” → normalized strings must match.  \n- `batchSize` equals the number of candidate entries received.  \n- All floats in [0,1]; `stackOverlap` in [0,100].\n",
+        "hasOutputParser": true,
+        "options": {
+          "systemMessage": "You are an expert technical analyst specializing in error pattern recognition. You analyze code relationships and return structured data for further processing. Always return valid JSON without any additional text or markdown."
+        }
+      },
+      "id": "448ffece-e0ec-47e3-9c1c-12ff8cfc8ba6",
+      "name": "Pattern Detection Agent",
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 2.2,
+      "position": [
+        -1248,
+        560
+      ]
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "id": "15c8e2ee-7f84-4cdb-989a-dbbdfb4ad774",
+      "name": "Google Gemini Chat Model",
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "typeVersion": 1,
+      "position": [
+        -1264,
+        800
+      ],
+      "credentials": {
+        "googlePalmApi": {
+          "id": "PO7lUEUewEkXiq8B",
+          "name": "Shared Gemini Key"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Collect and aggregate batch analysis results from AI agent\nconst batchResult = $input.first()?.json;\n\nconsole.log('Processing batch analysis result');\nconsole.log('Batch result keys:', Object.keys(batchResult || {}));\n\n// Store batch result for aggregation\n// This node will collect all batch results from the loop\nreturn {\n  json: {\n    batchData: batchResult,\n    timestamp: new Date().toISOString(),\n    action: 'collect_batch_result'\n  }\n};"
+      },
+      "id": "80025934-4a8a-40aa-a727-a2c8808960f5",
+      "name": "Collect Batch Results",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -944,
+        560
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Aggregate all batch results into structured data collection\nconst allBatchResults = $input.all();\nconsole.log(`Aggregating ${allBatchResults.length} batch results`);\n\n// Get the normalized incoming entry from the first batch result (they all have the same incoming entry)\nconst firstBatchData = allBatchResults[0]?.json?.staticData;\nconst normalizedIncomingEntry = $('Normalize Incoming Entry').first().json;\n\n// Helper function to parse JSON from AI response\nfunction parseAIResponse(result) {\n  try {\n    // Get the output from the AI response\n    let output = result.json?.batchData?.output || result.json?.output || result.json?.text || result.json?.content || '';\n    \n    // Remove markdown code blocks if present\n    if (output.includes('```json')) {\n      output = output.replace(/```json\\s*/, '').replace(/\\s*```$/, '');\n    } else if (output.includes('```')) {\n      output = output.replace(/```\\s*/, '').replace(/\\s*```$/, '');\n    }\n    \n    // Parse the JSON\n    const parsed = JSON.parse(output.trim());\n    console.log(`Successfully parsed batch ${parsed.batchNumber || 'unknown'}`);\n    return parsed;\n  } catch (error) {\n    console.error('Failed to parse AI response:', error);\n    console.error('Raw response:', JSON.stringify(result.json, null, 2));\n    return null;\n  }\n}\n\n// Extract batch data from all results\nconst batchAnalyses = allBatchResults.map(parseAIResponse).filter(Boolean);\nconsole.log(`Found ${batchAnalyses.length} valid batch analyses`);\n\n// Aggregate all related entries from all batches\nconst allRelatedEntries = [];\nconst allPatterns = [];\nconst crossBatchIndicators = [];\nlet highestScore = 0;\nlet totalAnalyzed = 0;\n\nbatchAnalyses.forEach((batch, index) => {\n  console.log(`Processing batch ${index + 1}:`, {\n    batchNumber: batch.batchNumber,\n    batchSize: batch.batchSize,\n    relatedFound: batch.batchSummary?.relatedFound\n  });\n  \n  if (batch.relatedEntries && Array.isArray(batch.relatedEntries)) {\n    // Add batch info to each entry\n    batch.relatedEntries.forEach(entry => {\n      entry.batchNumber = batch.batchNumber;\n      allRelatedEntries.push(entry);\n      if (entry.score > highestScore) {\n        highestScore = entry.score;\n      }\n    });\n  }\n  \n  if (batch.batchSummary?.patterns) {\n    allPatterns.push(...batch.batchSummary.patterns);\n  }\n  \n  if (batch.crossBatchIndicators) {\n    crossBatchIndicators.push(...batch.crossBatchIndicators);\n  }\n  \n  totalAnalyzed += batch.batchSummary?.totalAnalyzed || 0;\n});\n\n// Sort all related entries by score\nallRelatedEntries.sort((a, b) => b.score - a.score);\n\n// Take top entries overall (limit to prevent overwhelming output)\nconst topRelatedEntries = allRelatedEntries.slice(0, 10);\n\nconsole.log(`Aggregation complete:`);\nconsole.log(`- Total batches processed: ${batchAnalyses.length}`);\nconsole.log(`- Total entries analyzed: ${totalAnalyzed}`);\nconsole.log(`- Total related entries found: ${allRelatedEntries.length}`);\nconsole.log(`- Top entries selected: ${topRelatedEntries.length}`);\nconsole.log(`- Highest score: ${highestScore}`);\nconsole.log(`- Using normalized incoming entry: ${!!normalizedIncomingEntry}`);\n\n// Return structured data for HTML formatting agent\nreturn {\n  json: {\n    incomingEntry: normalizedIncomingEntry,\n    aggregatedResults: {\n      allRelatedEntries: topRelatedEntries,\n      allPatterns: allPatterns,\n      crossBatchIndicators: crossBatchIndicators,\n      stats: {\n        totalBatches: batchAnalyses.length,\n        totalAnalyzed: totalAnalyzed,\n        totalRelatedFound: allRelatedEntries.length,\n        topEntriesSelected: topRelatedEntries.length,\n        highestScore: highestScore\n      }\n    },\n    timestamp: new Date().toISOString(),\n    action: 'batch_results_aggregated'\n  }\n};"
+      },
+      "id": "dc29fdc4-2a04-4ff6-82d9-ba3226950f7b",
+      "name": "Aggregate Batch Results",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1424,
+        64
+      ]
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=You are an expert HTML report generator. You must follow the EXACT HTML structure template provided below. Do not deviate from this structure.\n\n## Input Data\nAggregated Results:\n{{ JSON.stringify($json.aggregatedResults, null, 2) }} \n\n## MANDATORY HTML STRUCTURE TEMPLATE\n\nYou MUST use this exact HTML structure and only fill in the data. Do not change the structure, classes, or styling:\n\n```html\n<div style=\"font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #f8f9fa; padding: 16px; border-radius: 8px; margin: 8px 0;\">\n  <!-- Summary Section -->\n  <div style=\"background: white; padding: 12px; border-radius: 6px; margin-bottom: 12px; box-shadow: 0 2px 4px rgba(0,0,0,0.1);\">\n    <div style=\"color: #2c3e50; font-size: 14px; font-weight: 600; margin-bottom: 8px;\">Pattern Analysis Complete</div>\n    <div style=\"color: #666; font-size: 12px;\">[REPLACE: Summary text about findings - keep brief]</div>\n  </div>\n\n  <!-- Related Issues Section (ONLY if high confidence entries exist) -->\n  [IF HIGH CONFIDENCE ENTRIES EXIST, INCLUDE THIS SECTION:]\n  <div style=\"background: white; padding: 12px; border-radius: 6px; margin-bottom: 12px; box-shadow: 0 2px 4px rgba(0,0,0,0.1);\">\n    <div style=\"color: #e74c3c; font-size: 14px; font-weight: 600; margin-bottom: 12px; border-left: 4px solid #e74c3c; padding-left: 8px;\">Related Issues Found</div>\n    \n    <!-- Entry Card Template (repeat for each high confidence entry) -->\n    <div style=\"border: 1px solid #ddd; border-radius: 6px; padding: 12px; margin-bottom: 12px; background: #fafafa;\">\n      <div style=\"display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;\">\n      <div style=\"font-weight: 600; color: #2c3e50;\">[REPLACE: Entry ID {entryId} (Batch {batchNumber})]</div>\n      [IF confidence == \"High\", render:]\n      <div style=\"background: #27ae60; color: white; padding: 2px 8px; border-radius: 12px; font-size: 11px; font-weight: 600;\">High Confidence</div>\n      [IF confidence == \"Medium\", render:]\n      <div style=\"background: #f39c12; color: white; padding: 2px 8px; border-radius: 12px; font-size: 11px; font-weight: 600;\">Medium Confidence</div>\n      [IF confidence == \"Low\", render:]\n      <div style=\"background: #95a5a6; color: white; padding: 2px 8px; border-radius: 12px; font-size: 11px; font-weight: 600;\">Low Confidence</div>\n    </div>\n\n      \n      <div style=\"margin-bottom: 8px; font-size: 13px; color: #333;\">\n        <strong>Score:</strong> [REPLACE: {score}] | \n        <strong>Confidence:</strong> [REPLACE: {confidence}]\n      </div>\n      \n      <!-- Signal Badges -->\n      <div style=\"display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px;\">\n        [REPLACE: Create signal badges for each signal in the entry, use this template:]\n        <!-- <div style=\"background: #3498db; color: white; padding: 2px 6px; border-radius: 3px; font-size: 10px;\">Signal Name: [REPLACE: {signal}]</div> -->\n      </div>\n      \n      <!-- Analysis Section -->\n      <div style=\"background: white; padding: 8px; border-radius: 4px; margin-bottom: 8px; border-left: 3px solid #8e44ad;\">\n        <div style=\"font-size: 11px; font-weight: 600; color: #8e44ad; margin-bottom: 4px;\">Technical Analysis</div>\n        <div style=\"font-size: 12px; color: #555; line-height: 1.4;\">[REPLACE: Detailed explanation of why entries are related]</div>\n      </div>\n      \n      <!-- Technical Details -->\n      <div style=\"font-size: 11px; color: #666; margin-bottom: 8px;\">\n        <div><strong>Top Frame:</strong> [REPLACE: {topFrame} or \"not available\"]</div>\n        <div><strong>Stack Overlap:</strong> [REPLACE: {stackOverlap} or \"not available\"]</div>\n        <div><strong>Error Type:</strong> [REPLACE: {errorType} or \"not available\"]</div>\n        <div><strong>Route:</strong> [REPLACE: {route} or \"not available\"]</div>\n        <div><strong>Environment:</strong> [REPLACE: {environment} or \"not available\"]</div>\n      </div>\n      \n      <!-- Linked Tickets Section (if any exist) -->\n      [IF LINKED TICKETS EXIST:]\n      <div style=\"background: #f8f9fa; padding: 8px; border-radius: 4px; margin-bottom: 8px; border-left: 3px solid #17a2b8;\">\n        <div style=\"font-size: 11px; font-weight: 600; color: #17a2b8; margin-bottom: 6px;\">🔗 Linked Tickets</div>\n        <div style=\"display: flex; flex-direction: column; gap: 3px;\">\n          [REPLACE: For each linked ticket, create a row:]\n          <!-- <div style=\"display: flex; align-items: center; padding: 3px 0;\">\n               <a href=\"https://veoci.com/v/c/67813/form/31809772/entry/{id}/input\" \n                  style=\"background: #17a2b8; color: white; padding: 2px 6px; border-radius: 3px; font-size: 10px; \n                         text-decoration: none; display: inline-block; margin-right: 8px; min-width: 60px; text-align: center;\">{id}</a>\n               <span style=\"font-size: 10px; color: #555; flex: 1;\">{name}</span>\n               </div> -->\n        </div>\n      </div>\n      \n      <!-- View Entry Link -->\n      <div style=\"text-align: right;\">\n        <a href=\"https://veoci.com/v/c/67813/form/35430484/entry/[REPLACE: {entryId}]/input\" \n           style=\"background: #3498db; color: white; padding: 6px 12px; border-radius: 4px; text-decoration: none; font-size: 11px; font-weight: 600;\">View Entry</a>\n      </div>\n    </div>\n    <!-- End Entry Card -->\n  </div>\n  \n  [IF NO HIGH CONFIDENCE ENTRIES:]\n  <div style=\"background: white; padding: 12px; border-radius: 6px; margin-bottom: 12px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); text-align: center;\">\n    <div style=\"color: #666; font-size: 14px;\">No high-confidence matches found</div>\n  </div>\n  \n  <!-- Recommendations Section (if any actionable recommendations) -->\n  [IF RECOMMENDATIONS EXIST:]\n  <div style=\"background: white; padding: 12px; border-radius: 6px; margin-bottom: 12px; box-shadow: 0 2px 4px rgba(0,0,0,0.1);\">\n    <div style=\"color: #27ae60; font-size: 14px; font-weight: 600; margin-bottom: 8px; border-left: 4px solid #27ae60; padding-left: 8px;\">Recommendations</div>\n    <ul style=\"margin: 0; padding-left: 16px; font-size: 12px; color: #555;\">\n      [REPLACE: List of actionable recommendations]\n    </ul>\n  </div>\n  \n  <!-- Stats (compact) -->\n  <div style=\"background: white; padding: 8px; border-radius: 6px; box-shadow: 0 2px 4px rgba(0,0,0,0.1);\">\n    <div style=\"color: #666; font-size: 11px; text-align: center;\">\n  Analyzed [REPLACE: {totalAnalyzed}] entries | Found [REPLACE: {totalRelatedFound}] related | \n  High: [REPLACE: {confidenceCounts.High}] | Medium: [REPLACE: {confidenceCounts.Medium}] | Low: [REPLACE: {confidenceCounts.Low}]\n</div>\n  </div>\n</div>\n```\n\n## CRITICAL INSTRUCTIONS\n1. **USE THE EXACT STRUCTURE ABOVE** - Do not change div structure, styling, or layout  \n2. **ONLY REPLACE BRACKETED PLACEHOLDERS** - Replace [REPLACE: ...] with actual data  \n4. **INCLUDE CONDITIONAL SECTIONS** - Show \"Related Issues\" section only if entries exist  \n5. **MAXIMUM 5 ENTRIES** - Show at most 5 entries  \n6. **NO MARKDOWN FORMATTING** - Return only the HTML, no code blocks or explanations  \n7. **LINKED TICKETS CONDITIONAL** - Always render an Entry Card, even if no linked tickets exist. If entry[\"24\"] is empty/null, simply omit the \"Linked Tickets\" section from that card. Do not skip the entire entry.  \n\n## Linked Tickets Handling\n- Check entry[\"24\"] or entry.24 (field 24) for linked tickets array  \n- If field 24 exists and is an array with tickets, show the Linked Tickets section  \n- For each ticket in the array, create a vertical row using this exact format:  \n  <div style=\"display: flex; align-items: center; padding: 3px 0;\">\n    <a href=\"https://veoci.com/v/c/67813/form/31809772/entry/{ticket.id}/input\" \n       style=\"background: #17a2b8; color: white; padding: 2px 6px; border-radius: 3px; font-size: 10px; text-decoration: none; display: inline-block; margin-right: 8px; min-width: 60px; text-align: center;\">{ticket.id}</a>\n    <span style=\"font-size: 10px; color: #555; flex: 1;\">{ticket.name}</span>\n  </div>  \n- Replace {ticket.id} with the actual ticket ID and {ticket.name} with the ticket name  \n- Each ticket should be on its own row, stacked vertically  \n- The ticket ID is clickable, the name is displayed as text next to it  \n- If no linked tickets exist or field 24 is empty/null, omit only the Linked Tickets block, not the entry card\n\n\n## Example Linked Tickets Rendering\nIf entry[\"24\"] = [{\"id\": \"123456\", \"name\": \"Bug Fix\"}, {\"id\": \"789012\", \"name\": \"Feature Request\"}]\nRender as:\n<div style=\"display: flex; align-items: center; padding: 3px 0;\">\n<a href=\"https://veoci.com/v/c/67813/form/31809772/entry/123456/input\" style=\"background: #17a2b8; color: white; padding: 2px 6px; border-radius: 3px; font-size: 10px; text-decoration: none; display: inline-block; margin-right: 8px; min-width: 60px; text-align: center;\">123456</a>\n<span style=\"font-size: 10px; color: #555; flex: 1;\">Bug Fix</span>\n</div>\n<div style=\"display: flex; align-items: center; padding: 3px 0;\">\n<a href=\"https://veoci.com/v/c/67813/form/31809772/entry/789012/input\" style=\"background: #17a2b8; color: white; padding: 2px 6px; border-radius: 3px; font-size: 10px; text-decoration: none; display: inline-block; margin-right: 8px; min-width: 60px; text-align: center;\">789012</a>\n<span style=\"font-size: 10px; color: #555; flex: 1;\">Feature Request</span>\n</div>\n\n## Data Extraction Rules\n- entryId: from entry.entryId\n- batchNumber: from entry.batchNumber  \n- score: from entry.score (format to 2 decimals)\n- confidence: from entry.confidence\n- signals: from entry.signals array\n- topFrame: from entry.topFrame\n- stackOverlap: from entry.stackOverlap\n- errorType: from entry.errorType\n- route: from entry.route\n- environment: from entry.environment\n- explanation: from entry.explanation\n- linkedTickets: from entry[\"24\"] or entry.24 (field 24 - array of simplified ticket objects)\n\n## Linked Tickets Handling\n- Check entry[\"24\"] or entry.24 (field 24) for linked tickets array\n- If field 24 exists and is an array with tickets, show the Linked Tickets section\n- For each ticket in the array, create a vertical row using this exact format:\n  <div style=\"display: flex; align-items: center; padding: 3px 0;\">\n  <a href=\"https://veoci.com/v/c/67813/form/31809772/entry/{ticket.id}/input\" \n     style=\"background: #17a2b8; color: white; padding: 2px 6px; border-radius: 3px; font-size: 10px; \n            text-decoration: none; display: inline-block; margin-right: 8px; min-width: 60px; text-align: center;\">{ticket.id}</a>\n  <span style=\"font-size: 10px; color: #555; flex: 1;\">{ticket.name}</span>\n  </div>\n- Replace {ticket.id} with the actual ticket ID and {ticket.name} with the ticket name\n- Each ticket should be on its own row, stacked vertically\n- The ticket ID is clickable, the name is displayed as text next to it\n- If no linked tickets exist or field 24 is empty/null, omit the entire Linked Tickets section\n- IMPORTANT: Always check for field 24 data in EVERY related entry, not just some entries\n\nReturn ONLY the filled HTML template with actual data replacing the placeholders.",
+        "hasOutputParser": true,
+        "options": {
+          "systemMessage": "You are an expert HTML report generator. Create professional, visually appealing HTML snippets based on structured data. Always return only the content HTML snippet without DOCTYPE, html, head, or body tags - suitable for injection into an existing page. Use inline CSS styling."
+        }
+      },
+      "id": "4555a7c8-6672-4efa-8364-a23a08b08a3b",
+      "name": "HTML Report Formatter",
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 2.2,
+      "position": [
+        -1248,
+        64
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Process HTML report and prepare final analysis result\nconst htmlResponse = $input.first()?.json;\nconst aggregatedData = $node[\"Aggregate Batch Results\"].json;\n\nconsole.log('Processing HTML report from formatter');\n\n// Extract HTML content from AI response\nlet htmlAnalysis = '';\ntry {\n  htmlAnalysis = htmlResponse.output || htmlResponse.data || htmlResponse.text || htmlResponse.content || '';\n  \n  // Clean up markdown code blocks that might be wrapping the HTML\n  if (htmlAnalysis.includes('```html')) {\n    console.log('Removing ```html markdown wrapper');\n    htmlAnalysis = htmlAnalysis.replace(/```html\\s*/, '').replace(/\\s*```$/, '');\n  } else if (htmlAnalysis.includes('```')) {\n    console.log('Removing ``` markdown wrapper');\n    htmlAnalysis = htmlAnalysis.replace(/```\\s*/, '').replace(/\\s*```$/, '');\n  }\n  \n  // Trim any extra whitespace\n  htmlAnalysis = htmlAnalysis.trim();\n  \n  console.log(`HTML report processed successfully (${htmlAnalysis.length} characters)`);\n  console.log('HTML starts with:', htmlAnalysis.substring(0, 100));\n} catch (error) {\n  console.error('Failed to extract HTML from formatter response:', error);\n  htmlAnalysis = '<div style=\"color: red;\">Error: Failed to generate HTML report</div>';\n}\n\n// Determine if related issues were found\nconst hasRelatedIssues = (aggregatedData?.aggregatedResults?.allRelatedEntries?.length || 0) > 0;\n\nconsole.log(`Final processing complete:`);\nconsole.log(`- Has related issues: ${hasRelatedIssues}`);\nconsole.log(`- HTML length: ${htmlAnalysis.length}`);\nconsole.log(`- Related entries: ${aggregatedData?.aggregatedResults?.allRelatedEntries?.length || 0}`);\n\n// Create final analysis result in expected format\nconst analysisResult = {\n  hasRelatedIssues: hasRelatedIssues,\n  htmlAnalysis: htmlAnalysis,\n  analysisType: 'formatted_html_report',\n  batchingStats: aggregatedData?.aggregatedResults?.stats || {},\n  timestamp: new Date().toISOString()\n};\n\n// Return in same format as original workflow expects\nreturn {\n  json: {\n    processedEntry: aggregatedData?.incomingEntry || {},\n    aiAnalysis: analysisResult,\n    timestamp: new Date().toISOString(),\n    action: 'html_formatted_analysis_complete'\n  }\n};"
+      },
+      "id": "d00c95bb-0497-4fb1-a8d8-dab32b6d0bef",
+      "name": "Process HTML Report",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -928,
+        64
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "c1f7b3a0-1234-4567-8901-condition001",
+              "leftValue": "={{ $json.processedEntry.severity }}",
+              "rightValue": "error",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "eeafce29-bd2b-450f-a537-efb317d3040a",
+      "name": "Is High Priority Error?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        -736,
+        64
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// High priority error processing logic with AI HTML analysis\nconst data = $input.first()?.json;\nconst aiAnalysis = data?.aiAnalysis;\n\nconsole.log('Processing high priority error:', data?.processedEntry?.errorMessage || 'Unknown error');\nconsole.log('AI Analysis Type:', aiAnalysis?.analysisType);\nconsole.log('AI Analysis - Related Issues:', aiAnalysis?.hasRelatedIssues);\n\n// Enhanced processing logic based on AI pattern analysis\nlet processingAction = 'high_priority_processing';\nlet recommendations = [\n  'Immediate investigation required',\n  'Check for widespread impact',\n  'Consider hotfix deployment'\n];\n\n// Modify recommendations based on AI pattern findings\nif (aiAnalysis?.hasRelatedIssues) {\n  processingAction = 'high_priority_pattern_detected';\n  recommendations.unshift('⚠️ RELATED PATTERN DETECTED - Broader investigation recommended');\n  recommendations.push('📋 Review detailed HTML analysis report for specific relationships');\n  recommendations.push('🔗 Check linked entries in the analysis report');\n  recommendations.push('🏷️ Consider creating an epic to track this error pattern');\n  recommendations.push('📞 Escalate to senior developer for pattern review');\n} else {\n  recommendations.push('✅ No related patterns detected - treat as isolated incident');\n}\n\n// Include the HTML analysis report in the response\nconst htmlReport = aiAnalysis?.htmlAnalysis || '<div>No analysis report available</div>';\n\nreturn {\n  json: {\n    action: processingAction,\n    errorInfo: data.processedEntry,\n    aiAnalysis: {\n      hasRelatedIssues: aiAnalysis?.hasRelatedIssues || false,\n      analysisType: aiAnalysis?.analysisType || 'unknown',\n      htmlReport: htmlReport,\n      reportLength: htmlReport.length\n    },\n    alertLevel: 'URGENT',\n    timestamp: new Date().toISOString(),\n    recommendations: recommendations,\n    nextActions: [\n      'Review HTML analysis report for pattern details',\n      'Investigate all linked related entries',\n      'Assess if this requires immediate hotfix',\n      'Document findings for future reference'\n    ]\n  }\n};"
+      },
+      "id": "3551797c-eac7-4753-abab-2face7c91f4c",
+      "name": "High Priority Alert",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -496,
+        -16
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Standard processing for non-critical errors with AI HTML analysis\nconst data = $input.first()?.json;\nconst aiAnalysis = data?.aiAnalysis;\n\nconsole.log('Processing standard error:', data?.processedEntry?.errorMessage || 'Unknown error');\nconsole.log('AI Analysis Type:', aiAnalysis?.analysisType);\nconsole.log('AI Analysis - Related Issues:', aiAnalysis?.hasRelatedIssues);\n\n// Enhanced processing logic based on AI pattern analysis\nlet processingAction = 'standard_processing';\nlet recommendations = [\n  'Add to triage queue',\n  'Review during next sprint planning',\n  'Monitor for additional similar issues'\n];\n\n// Modify recommendations based on AI pattern findings\nif (aiAnalysis?.hasRelatedIssues) {\n  processingAction = 'standard_pattern_detected';\n  \n  recommendations = [\n    '🔍 PATTERN DETECTED - Related issues found',\n    '📋 Review detailed HTML analysis report',\n    '🔗 Investigate all linked entries for common root cause',\n    '📊 Consider grouping these issues for coordinated fix',\n    '🏷️ Add pattern analysis details to ticket description'\n  ];\n  \n  recommendations.push('📅 Prioritize in next sprint due to pattern detection');\n  recommendations.push('🔄 Set up monitoring for this error pattern');\n  recommendations.push('📝 Document pattern findings for team knowledge base');\n} else {\n  recommendations.push('✅ No related patterns detected - standard triage process');\n  recommendations.push('🔍 Keep monitoring for future similar issues');\n}\n\n// Include the HTML analysis report in the response\nconst htmlReport = aiAnalysis?.htmlAnalysis || '<div>No analysis report available</div>';\n\nreturn {\n  json: {\n    action: processingAction,\n    errorInfo: data.processedEntry,\n    aiAnalysis: {\n      hasRelatedIssues: aiAnalysis?.hasRelatedIssues || false,\n      analysisType: aiAnalysis?.analysisType || 'unknown',\n      htmlReport: htmlReport,\n      reportLength: htmlReport.length\n    },\n    alertLevel: 'NORMAL',\n    timestamp: new Date().toISOString(),\n    recommendations: recommendations,\n    nextActions: [\n      'Review HTML analysis report for insights',\n      'Check linked entries if patterns found',\n      'Add to appropriate sprint backlog',\n      'Update team on any significant patterns'\n    ]\n  }\n};"
+      },
+      "id": "03c5627b-b65a-40a7-b025-5d97b74115be",
+      "name": "Standard Processing",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -496,
+        160
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Prepare data for posting AI analysis to Veoci room\nconst data = $input.first()?.json;\nconst aiAnalysis = data?.aiAnalysis;\nconst errorInfo = data?.errorInfo;\n\nconsole.log('Preparing Veoci room message for entry:', errorInfo?.id);\nconsole.log('Analysis type:', aiAnalysis?.analysisType);\nconsole.log('Has related issues:', aiAnalysis?.hasRelatedIssues);\n\n// Get the HTML analysis report\nconst htmlMessage = aiAnalysis?.htmlReport || '<div>No analysis report available</div>';\n\n// Create thread ID based on original entry ID\nconst originalEntryId = $('Normalize Incoming Entry').last().json.entryId;\nconst threadId = `sosobject-${originalEntryId}`;\n\n// Generate timestamp for the API call\nconst timestamp = Date.now();\n\n// Prepare the API URL with timestamp\nconst apiUrl = `https://veoci.com/api/v2/classic/v1/rooms/67813/messages?timestamp=${timestamp}`;\n\nconsole.log('Veoci API Details:');\nconsole.log('- URL:', apiUrl);\nconsole.log('- Thread ID:', threadId);\nconsole.log('- Message length:', htmlMessage.length);\nconsole.log('- Original Entry ID:', originalEntryId);\n\n// Return the prepared data for the HTTP node\nreturn {\n  json: {\n    apiUrl: apiUrl,\n    formData: {\n      message: htmlMessage,\n      thread: threadId,\n      web: 'true',\n      mobile: 'false',\n      important: 'false'\n    },\n    metadata: {\n      originalEntryId: originalEntryId,\n      threadId: threadId,\n      timestamp: timestamp,\n      messageLength: htmlMessage.length,\n      hasRelatedIssues: aiAnalysis?.hasRelatedIssues || false\n    }\n  }\n};"
+      },
+      "id": "9363bc31-49b6-484e-9537-2ac206484d81",
+      "name": "Prepare Veoci Message",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -256,
+        48
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Map Bugsnag project IDs to application identifiers for API filtering\nconst authData = $input.first()?.json;\n\nconsole.log('Calculate Project Mapping: Processing auth data');\n\n// Project ID → Product(s) mapping\nconst projectMap = {\n  '5ab165c70495e12b288d3113': ['veoci-client'],\n  '59248fbbe96871001600a9ac': ['soschat-api-v2','sochat-web','sosquartz','api-v2'],\n  '5f1875273e1741000a1a4a25': ['veoci-mobile-client'],\n  '685aa9057dff92001cad8791': ['veoci-ai']\n};\n\nlet projectId = null;\nlet originalEntry = null;\nlet dataSource = 'unknown';\n\ntry {\n  // Try webhook path first\n  try {\n    const normalizedEntry = $('Normalize Incoming Entry').first().json;\n    if (normalizedEntry) {\n      projectId = normalizedEntry['21'];\n      originalEntry = normalizedEntry;\n      dataSource = 'webhook';\n      console.log('Mapping calculation - Using webhook path, Project ID:', projectId);\n    }\n  } catch (e) {\n    console.log('Webhook path not available (expected for manual trigger)');\n  }\n\n  // Fallback to manual trigger path\n  if (!projectId) {\n    try {\n      const sampleData = $('Sample Data Injector').first().json;\n      if (sampleData && sampleData.values) {\n        projectId = sampleData.values['21']?.data?.value;\n        originalEntry = sampleData;\n        dataSource = 'manual_trigger';\n        console.log('Mapping calculation - Using manual trigger path, Project ID:', projectId);\n      }\n    } catch (e) {\n      console.log('Manual trigger path not available (expected for webhook)');\n    }\n  }\n\n  // Map project ID → products for custom_26\n  const mappedProducts = projectMap[projectId] || [];\n\n  console.log('Project mapping complete:');\n  console.log('- Project ID:', projectId);\n  console.log('- Products:', mappedProducts);\n  console.log('- Data source:', dataSource);\n\n  return {\n    json: {\n      ...authData, // Pass through upstream data\n      projectId,\n      mappedProducts,\n      originalEntry,\n      projectMappingCalculation: {\n        projectId,\n        mappedProducts,\n        dataSource,\n        timestamp: new Date().toISOString()\n      }\n    }\n  };\n\n} catch (error) {\n  console.error('Project mapping error:', error);\n\n  return {\n    json: {\n      ...authData,\n      projectId: null,\n      mappedProducts: [],\n      originalEntry: null,\n      projectMappingCalculation: {\n        error: error.message,\n        mappedProducts: [],\n        dataSource: 'error',\n        timestamp: new Date().toISOString()\n      }\n    }\n  };\n}\n"
+      },
+      "id": "d5540baa-5537-4b3f-afda-2bb927859910",
+      "name": "Calculate Project Mapping",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -2240,
+        480
+      ]
+    },
+    {
+      "parameters": {
+        "url": "https://veoci.com/api/v2/forms/35430484/entries",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "oAuth2Api",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "c",
+              "value": "67813"
+            },
+            {
+              "name": "filters",
+              "value": "={{ \n  (() => {\n    const entry = $('Normalize Incoming Entry').first().json;\n    const frames = entry['8'] || [];\n\n    // Separate vendor vs app frames\n    const nonVendor = frames.filter(f => !f.vendor && f.file);\n    const vendor = frames.filter(f => f.vendor && f.file);\n\n    // Choose which frames to filter on\n    const chosenFrames = (nonVendor.length > 0 ? nonVendor : vendor)\n      .filter((f, idx, arr) => f.file && arr.findIndex(ff => ff.file === f.file) === idx);\n\n    // Base filters\n    const filters = [\n      {\n        columnId: \"custom_26\",\n        condition: \"oneof\",\n        type: \"select\",\n        value: { \n          type: \"select\", \n          value: $('Calculate Project Mapping').first().json.mappedProducts \n        }\n      },\n      {\n        columnId: \"lastModified\",\n        condition: \"after\",\n        type: \"dateTime\",\n        value: {\n          relDate: { number: \"8\", units: \"weeks\", era: \"past\" },\n          value: -4838400000,\n          type: \"rel\",\n          dateOnly: false\n        }\n      },\n      {\n        type: \"subgroup\",\n        subgroup: {\n          anyAll: \"any\",\n          filters: chosenFrames.map(frame => ({\n            columnId: \"custom_8\",\n            condition: \"contains\",\n            type: \"text\",\n            value: { type: \"text\", value: frame.file }\n          })),\n          type: \"advanced\"\n        }\n      }\n    ];\n\n    return JSON.stringify({\n      aggregates: [],\n      columns: [],\n      filters: {\n        advancedFilters: {\n          anyAll: \"all\",\n          displayFilters: [],\n          filters,\n          type: \"advanced\",\n          highlightDisplay: \"classic\"\n        }\n      },\n      searchString: \"\",\n      showExactDates: true,\n      sortCol: \"lastModified\",\n      sortDir: false,\n      bypassSqlTable: false,\n      groupBySort: \"alphaAsc\",\n      bypassArchiving: true\n    });\n  })() \n}}\n"
+            }
+          ]
+        },
+        "options": {
+          "response": {}
+        }
+      },
+      "id": "676a4c9c-57d5-4d04-ae3c-ce482ffde276",
+      "name": "Get Veoci Form Entries",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -2048,
+        480
+      ],
+      "credentials": {
+        "oAuth2Api": {
+          "id": "Yyrjr0vNnqThbyYr",
+          "name": "Veoci Dev App User"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "=https://veoci.com/api/v2/forms/35430484/entries/{{ $('Normalize Incoming Entry').first().json.entryId }}?c={{ $('Normalize Incoming Entry').first().json.containerId }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "oAuth2Api",
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={\n  \"append\": true,\n  \"values\": {\n    \"53\": {\n      \"data\": { \"value\": {{ JSON.stringify($('Prepare Veoci Message').item.json.formData.message) }} }\n    }\n  }\n}",
+        "options": {}
+      },
+      "id": "5020c41c-15d2-41f4-b465-86b32b4e774d",
+      "name": "Update Dev Entry",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -48,
+        48
+      ],
+      "credentials": {
+        "oAuth2Api": {
+          "id": "Yyrjr0vNnqThbyYr",
+          "name": "Veoci Dev App User"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "modelName": "models/gemini-2.5-flash-lite",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "typeVersion": 1,
+      "position": [
+        -1280,
+        288
+      ],
+      "id": "d9c02d63-9024-4820-ab63-8e3424d189ad",
+      "name": "Google Gemini Chat Model1",
+      "credentials": {
+        "googlePalmApi": {
+          "id": "PO7lUEUewEkXiq8B",
+          "name": "Shared Gemini Key"
+        }
+      }
+    }
+  ],
+  "pinData": {
+    "Webhook - Receive Veoci Entry": [
+      {
+        "json": {
+          "id": "1354923439",
+          "orgSequenceId": null,
+          "objectType": "FORM_ENTRY",
+          "container": {
+            "id": "67813",
+            "name": "Veoci Ticketing",
+            "type": "SUBROOM",
+            "created": 1532355210000,
+            "modified": 1668524987268,
+            "orgId": "1",
+            "state": "LIVE",
+            "themeName": "opzim",
+            "supportUrl": null,
+            "group": {
+              "id": "6261",
+              "name": "Operations",
+              "type": "GROUP",
+              "created": null,
+              "modified": null,
+              "orgId": "1",
+              "state": null,
+              "themeName": "opzim",
+              "supportUrl": null,
+              "group": null,
+              "realName": null,
+              "domain": "veoci.com",
+              "publicDomain": null,
+              "parent": null
+            },
+            "realName": "Veoci Ticketing",
+            "domain": "veoci.com",
+            "publicDomain": null,
+            "parent": null
+          },
+          "name": "2025-Mar-31 10:49: Bugsnag ( open) -  PROD:AG Grid: cannot get grid to draw rows when it is in the middle of drawing rows. Your code probably called a grid API method while the grid was in the render stage. To overcome this, put the API call into a timeo…",
+          "lastModified": 1757945971083,
+          "properties": {},
+          "created": 1743432540847,
+          "createdBy": {
+            "id": "573460",
+            "name": "Veoci GitHub Integration",
+            "displayName": "Veoci GitHub Integration",
+            "type": "APPLICATION",
+            "ignoreCredentialsExpired": false,
+            "guest": true
+          },
+          "modifiedBy": {
+            "id": "573460",
+            "name": "Veoci GitHub Integration",
+            "displayName": "Veoci GitHub Integration",
+            "type": "APPLICATION",
+            "ignoreCredentialsExpired": false,
+            "guest": true
+          },
+          "uuid": "kr6ntcv3rcrt4rtf",
+          "values": {
+            "0": {
+              "fieldId": "571841",
+              "position": 11,
+              "fieldType": "TEXT",
+              "data": {
+                "valueType": "STRING",
+                "value": "https://app.bugsnag.com/grey-wall-software-llc/veoci-vue/errors/67eaab574a63f0076686e85f?event_id=68c8207101486195ee980000&i=wh&m=fq"
+              }
+            },
+            "1": {
+              "fieldId": "571845",
+              "position": 23,
+              "fieldType": "TEXT",
+              "data": {
+                "valueType": "STRING",
+                "value": "error"
+              }
+            },
+            "2": {
+              "fieldId": "571840",
+              "position": 3,
+              "fieldType": "SINGLE",
+              "data": {
+                "valueType": "SINGLE",
+                "value": "open"
+              }
+            },
+            "3": {
+              "fieldId": "571859",
+              "position": 37,
+              "fieldType": "TEXT",
+              "data": {
+                "valueType": "STRING",
+                "value": "68c8207101486195ee980000"
+              }
+            },
+            "4": {
+              "fieldId": "571860",
+              "position": 38,
+              "fieldType": "TEXT",
+              "data": {
+                "valueType": "STRING",
+                "value": "67eaab574a63f0076686e85f"
+              }
+            },
+            "5": {
+              "fieldId": "571843",
+              "position": 21,
+              "fieldType": "TEXT",
+              "data": {
+                "valueType": "STRING",
+                "value": "AG Grid: cannot get grid to draw rows when it is in the middle of drawing rows. Your code probably called a grid API method while the grid was in the render stage. To overcome this, put the API call into a timeout, e.g. instead of api.redrawRows(), call setTimeout(function() { api.redrawRows(); }, 0). To see what part of your code that caused the refresh check this stacktrace."
+              }
+            },
+            "6": {
+              "fieldId": "571844",
+              "position": 22,
+              "fieldType": "TEXT",
+              "data": {
+                "valueType": "STRING",
+                "value": "/v/c/288823/pages/cots-central-region/coalition-member-contacts"
+              }
+            },
+            "7": {
+              "fieldId": "571848",
+              "position": 26,
+              "fieldType": "TEXT",
+              "data": {
+                "valueType": "STRING",
+                "value": "15713628"
+              }
+            },
+            "8": {
+              "fieldId": "571846",
+              "position": 24,
+              "fieldType": "LONG_TEXT",
+              "data": {
+                "valueType": "LONG_TEXT",
+                "value": "<h2>Stacktrace</h2><div style=\"margin-bottom: 10px;\"><strong>node_modules/ag-grid-community/dist/package/main.esm.mjs:32545</strong> -       throw new Error(</div><div style=\"margin-bottom: 10px;\"><strong>node_modules/ag-grid-community/dist/package/main.esm.mjs:32495</strong> -     this.getLockOnRefresh();</div><div style=\"margin-bottom: 10px;\"><strong>node_modules/ag-grid-community/dist/package/main.esm.mjs:32369</strong> -     this.redrawAfterModelUpdate(params);</div><div style=\"margin-bottom: 10px;\"><strong>node_modules/ag-grid-community/dist/package/main.esm.mjs:71</strong> -       const callback = this.frameworkOverrides ? () =&gt; this.frameworkOverrides.wrapIncoming(() =&gt; listener(event)) : () =&gt; listener(event);</div><div style=\"margin-bottom: 10px;\"><strong>node_modules/ag-grid-community/dist/package/main.esm.mjs:75</strong> -         callback();</div><div style=\"margin-bottom: 10px;\"><strong>node_modules/ag-grid-community/dist/package/main.esm.mjs:67</strong> -     const processEventListeners = (listeners2, originalListeners2) =&gt; listeners2.forEach((listener) =&gt; {<!-- --></div>"
+              }
+            },
+            "13": {
+              "fieldId": "571857",
+              "position": 35,
+              "fieldType": "TEXT",
+              "data": {
+                "valueType": "STRING",
+                "value": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
+              }
+            },
+            "15": {
+              "fieldId": "571855",
+              "position": 33,
+              "fieldType": "TEXT",
+              "data": {
+                "valueType": "STRING",
+                "value": "Windows 10.0"
+              }
+            },
+            "16": {
+              "fieldId": "571856",
+              "position": 34,
+              "fieldType": "TEXT",
+              "data": {
+                "valueType": "STRING",
+                "value": "Chrome - 140.0.0"
+              }
+            },
+            "18": {
+              "fieldId": "571853",
+              "position": 31,
+              "fieldType": "TEXT",
+              "data": {
+                "valueType": "STRING",
+                "value": "320.2.3 - PROD"
+              }
+            },
+            "20": {
+              "fieldId": "571862",
+              "position": 40,
+              "fieldType": "TEXT",
+              "data": {
+                "valueType": "STRING",
+                "value": "https://api.bugsnag.com/projects/5ab165c70495e12b288d3113/errors/67eaab574a63f0076686e85f"
+              }
+            },
+            "21": {
+              "fieldId": "571858",
+              "position": 36,
+              "fieldType": "TEXT",
+              "data": {
+                "valueType": "STRING",
+                "value": "5ab165c70495e12b288d3113"
+              }
+            },
+            "23": {
+              "fieldId": "571861",
+              "position": 39,
+              "fieldType": "TEXT",
+              "data": {
+                "valueType": "STRING",
+                "value": "open"
+              }
+            },
+            "24": {
+              "fieldId": "571842",
+              "position": 15,
+              "fieldType": "FORM_ENTRY",
+              "data": {
+                "valueType": "FORM_ENTRY",
+                "value": [
+                  {
+                    "id": "1354927868",
+                    "orgSequenceId": null,
+                    "container": {
+                      "id": "67813",
+                      "name": "Veoci Ticketing",
+                      "type": "SUBROOM",
+                      "created": null,
+                      "modified": null,
+                      "orgId": "1",
+                      "state": null,
+                      "themeName": null,
+                      "supportUrl": null,
+                      "group": null,
+                      "realName": null,
+                      "domain": null,
+                      "publicDomain": null,
+                      "parent": null
+                    },
+                    "name": "#112698 Bug: AG Grid: cannot get grid to draw rows when it is in the middle of drawing rows. (New / Bug)",
+                    "lastModified": 1743433628615,
+                    "properties": {},
+                    "created": 1758018790991,
+                    "createdBy": null,
+                    "modifiedBy": null,
+                    "uuid": null,
+                    "progress": null,
+                    "type": "FORM_ENTRY"
+                  }
+                ]
+              }
+            },
+            "25": {
+              "fieldId": "572018",
+              "position": 18,
+              "fieldType": "TEXT",
+              "data": {
+                "valueType": "STRING",
+                "value": "PROD"
+              }
+            },
+            "26": {
+              "fieldId": "781569",
+              "position": 17,
+              "fieldType": "SINGLE",
+              "data": {
+                "valueType": "SINGLE",
+                "value": "veoci-client"
+              }
+            },
+            "27": {
+              "fieldId": "787634",
+              "position": 20,
+              "fieldType": "TEXT",
+              "data": {
+                "valueType": "STRING",
+                "value": "Error"
+              }
+            },
+            "28": {
+              "fieldId": "794792",
+              "position": 19,
+              "fieldType": "MULTI",
+              "data": {
+                "valueType": "MULTI",
+                "value": [
+                  "PROD"
+                ]
+              }
+            },
+            "34": {
+              "fieldId": "837052",
+              "position": 1,
+              "fieldType": "LONG_TEXT",
+              "data": {
+                "valueType": "LONG_TEXT",
+                "value": "<div style=\"margin-bottom: 10px;\">\n            <p>Error ID: <strong>67eaab574a63f0076686e85f</strong></p>\n            <strong>Error:</strong>AG Grid: cannot get grid to draw rows when it is in the middle of drawing rows. Your code probably called a grid API method while the grid was in the render stage. To overcome this, put the API call into a timeout, e.g. instead of api.redrawRows(), call setTimeout(function() { api.redrawRows(); }, 0). To see what part of your code that caused the refresh check this stacktrace. \n                     <p>Error occurred at: <strong>node_modules/ag-grid-community/dist/package/main.esm.mjs:32545</strong> -        throw new Error(</p>\n                     <p>View error in <a href=\"https://app.bugsnag.com/grey-wall-software-llc/veoci-vue/errors/67eaab574a63f0076686e85f?event_id=68c8207101486195ee980000&amp;i=wh&amp;m=fq\" target=\"_blank\" rel=\"noopener noreferrer\">Bugsnag</a></p> \n                     <p></p>\n                   </div>"
+              }
+            },
+            "36": {
+              "fieldId": "850543",
+              "position": 9,
+              "fieldType": "SINGLE",
+              "data": {
+                "valueType": "SINGLE",
+                "value": "powerTen"
+              }
+            },
+            "37": {
+              "fieldId": "850544",
+              "position": 10,
+              "fieldType": "TEXT",
+              "data": {
+                "valueType": "STRING",
+                "value": "10th event"
+              }
+            },
+            "40": {
+              "fieldId": "1231077",
+              "position": 42,
+              "fieldType": "NUMERIC",
+              "data": {
+                "valueType": "NUMBER",
+                "value": 100
+              }
+            },
+            "41": {
+              "fieldId": "1231078",
+              "position": 43,
+              "fieldType": "SINGLE",
+              "data": {
+                "valueType": "SINGLE",
+                "value": "Normal"
+              }
+            },
+            "45": {
+              "fieldId": "1231252",
+              "position": 45,
+              "fieldType": "SINGLE",
+              "data": {
+                "valueType": "SINGLE",
+                "value": "Dev Rev"
+              }
+            },
+            "46": {
+              "fieldId": "1232702",
+              "position": 46,
+              "fieldType": "SINGLE",
+              "data": {
+                "valueType": "SINGLE",
+                "value": "Bug"
+              }
+            },
+            "47": {
+              "fieldId": "1246087",
+              "position": 47,
+              "fieldType": "SINGLE",
+              "data": {
+                "valueType": "SINGLE",
+                "value": "Not a Regression"
+              }
+            }
+          },
+          "mandatoryFields": null,
+          "archived": false,
+          "userVisibleId": null,
+          "owner": null,
+          "mode": "NORMAL",
+          "flags": {
+            "29": "DISABLED",
+            "31": "DISABLED",
+            "32": "DISABLED",
+            "38": "DISABLED",
+            "49": "DISABLED"
+          },
+          "enabledOptions": {},
+          "formId": "35430484",
+          "sourceObject": null,
+          "relatedEntries": null,
+          "permission": {
+            "canEdit": true,
+            "canDelete": true
+          },
+          "operationalPeriodId": null,
+          "modifiedValues": [],
+          "parentId": null,
+          "postEntryMessage": null,
+          "updatePostEntryMessage": null,
+          "bgColors": null
+        }
+      }
+    ]
+  },
+  "connections": {
+    "Webhook - Receive Veoci Entry": {
+      "main": [
+        [
+          {
+            "node": "Normalize Incoming Entry",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Incoming Entry": {
+      "main": [
+        [
+          {
+            "node": "Calculate Project Mapping",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is High Priority Error?": {
+      "main": [
+        [
+          {
+            "node": "High Priority Alert",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Standard Processing",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pattern Detection Agent": {
+      "main": [
+        [
+          {
+            "node": "Collect Batch Results",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Data for AI Analysis": {
+      "main": [
+        [
+          {
+            "node": "Split Entries Into Batches",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Split Entries Into Batches": {
+      "main": [
+        [
+          {
+            "node": "Aggregate Batch Results",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Prepare Batch for AI",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Batch for AI": {
+      "main": [
+        [
+          {
+            "node": "Pattern Detection Agent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Collect Batch Results": {
+      "main": [
+        [
+          {
+            "node": "Split Entries Into Batches",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Aggregate Batch Results": {
+      "main": [
+        [
+          {
+            "node": "HTML Report Formatter",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HTML Report Formatter": {
+      "main": [
+        [
+          {
+            "node": "Process HTML Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Process HTML Report": {
+      "main": [
+        [
+          {
+            "node": "Is High Priority Error?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "High Priority Alert": {
+      "main": [
+        [
+          {
+            "node": "Prepare Veoci Message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Standard Processing": {
+      "main": [
+        [
+          {
+            "node": "Prepare Veoci Message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Veoci Message": {
+      "main": [
+        [
+          {
+            "node": "Update Dev Entry",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Google Gemini Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Pattern Detection Agent",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Calculate Project Mapping": {
+      "main": [
+        [
+          {
+            "node": "Get Veoci Form Entries",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Veoci Form Entries": {
+      "main": [
+        [
+          {
+            "node": "Prepare Data for AI Analysis",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Google Gemini Chat Model1": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "HTML Report Formatter",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "callerPolicy": "workflowsFromSameOwner",
+    "availableInMCP": false,
+    "errorWorkflow": "zI4jPpptPcooklK2",
+    "timeSavedPerExecution": 5
+  },
+  "versionId": "c98db4e9-3689-4e36-a146-cc6bb9be5d39",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "2b71f4a8dbc995cc64e9c2d93448c3aeed875e080207645877f62b5f9ff7c63e"
+  },
+  "id": "2efjtC2CoBgkouGy",
+  "tags": [
+    {
+      "updatedAt": "2025-10-03T10:20:36.849Z",
+      "createdAt": "2025-10-03T10:20:36.849Z",
+      "id": "eW1sAt1sJqrbSudw",
+      "name": "Bugsnag Triage"
+    }
+  ]
+}
