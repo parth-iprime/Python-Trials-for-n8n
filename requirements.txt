@@ -3,5 +3,6 @@ numpy
 scikit-learn
 flask
 gunicorn
+google-generativeai
 
 

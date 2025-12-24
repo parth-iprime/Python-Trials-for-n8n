@@ -1,6 +1,7 @@
 import sys
 import json
 import re
+import os
 import pandas as pd
 import numpy as np
 from typing import List, Dict, Any, Tuple
@@ -8,6 +9,21 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 from datetime import datetime
 from urllib.parse import urlparse
+
+# Gemini embeddings (optional - falls back to TF-IDF if not configured)
+try:
+    import google.generativeai as genai
+    GEMINI_AVAILABLE = True
+except ImportError:
+    GEMINI_AVAILABLE = False
+    genai = None
+
+# Configuration
+GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
+USE_SEMANTIC_EMBEDDINGS = GEMINI_AVAILABLE and GEMINI_API_KEY is not None
+
+if USE_SEMANTIC_EMBEDDINGS:
+    genai.configure(api_key=GEMINI_API_KEY)
 
 # --- 1. HELPER FUNCTIONS ---
 
@@ -23,6 +39,68 @@ def is_vendor_file(file_path: str) -> bool:
         r"javax?\.", r"sun\.reflect\."
     ]
     return any(re.search(p, file_path) for p in vendor_patterns)
+
+def is_generic_frame(file_name: str, line_num: int = None) -> bool:
+    """
+    Detect generic/minified frames that are too vague for reliable matching.
+    These frames indicate bundled code where source maps aren't resolving.
+    """
+    if not file_name:
+        return True
+    
+    # Remove extension for checking
+    base_name = re.sub(r'\.(js|mjs|ts|vue|jsx|tsx)$', '', file_name.lower())
+    
+    # Generic bundled file patterns
+    generic_patterns = [
+        r'^app$',           # Generic app bundle
+        r'^main$',          # Generic main entry
+        r'^index$',         # Generic index
+        r'^bundle$',        # Generic bundle
+        r'^vendor$',        # Vendor bundle
+        r'^chunk',          # Webpack chunks
+        r'^runtime',        # Runtime bundles
+        r'^polyfills?$',    # Polyfill bundles
+        r'^commons?$',      # Common chunks
+        r'^shared$',        # Shared bundles
+        r'^\d+$',           # Numeric chunk names (e.g., "123.js")
+    ]
+    
+    is_generic = any(re.match(p, base_name) for p in generic_patterns)
+    
+    # Line 1 is especially suspicious - often indicates unresolved source maps
+    if line_num == 1 and is_generic:
+        return True
+    
+    return is_generic
+
+def get_frame_quality(top_frame: str) -> str:
+    """
+    Assess the quality/specificity of a stack frame for matching.
+    Returns: 'high', 'medium', or 'low'
+    """
+    if not top_frame:
+        return 'low'
+    
+    # Parse "file:line" format
+    parts = top_frame.rsplit(':', 1)
+    file_name = parts[0] if parts else top_frame
+    line_num = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else None
+    
+    if is_generic_frame(file_name, line_num):
+        return 'low'
+    
+    # Check for specific component names (Vue, React, etc.)
+    specific_patterns = [
+        r'[A-Z][a-z]+[A-Z]',  # CamelCase components
+        r'\.(vue|component|service|controller|handler)',  # Specific file types
+        r'(form|modal|dialog|table|list|view|page)',  # UI components
+    ]
+    
+    if any(re.search(p, file_name, re.IGNORECASE) for p in specific_patterns):
+        return 'high'
+    
+    return 'medium'
 
 def extract_error_type(error_message: str) -> str:
     """Extract error type from error message (e.g., TypeError, Error, ReferenceError)"""
@@ -87,6 +165,87 @@ def parse_browser_info(browser: str, ua_string: str) -> Dict[str, Any]:
 def normalize_environment(release_stage: str, app_type: str) -> str:
     """Normalize environment string (e.g., PROD-MOBILE)"""
     env_parts = []
+
+# --- SEMANTIC EMBEDDINGS ---
+
+def get_gemini_embeddings(texts: List[str]) -> List[List[float]]:
+    """
+    Get embeddings for a list of texts using Gemini's text-embedding-004 model.
+    Returns list of embedding vectors.
+    """
+    if not USE_SEMANTIC_EMBEDDINGS or not texts:
+        return []
+    
+    embeddings = []
+    try:
+        for text in texts:
+            if not text or not text.strip():
+                # Return zero vector for empty text
+                embeddings.append([0.0] * 768)  # text-embedding-004 dimension
+                continue
+            
+            result = genai.embed_content(
+                model="models/text-embedding-004",
+                content=text,
+                task_type="SEMANTIC_SIMILARITY"
+            )
+            embeddings.append(result['embedding'])
+    except Exception as e:
+        print(f"Warning: Gemini embedding failed: {e}", file=sys.stderr)
+        return []
+    
+    return embeddings
+
+def cosine_similarity_vectors(vec1: List[float], vec2: List[float]) -> float:
+    """Calculate cosine similarity between two vectors."""
+    if not vec1 or not vec2:
+        return 0.0
+    
+    vec1 = np.array(vec1)
+    vec2 = np.array(vec2)
+    
+    norm1 = np.linalg.norm(vec1)
+    norm2 = np.linalg.norm(vec2)
+    
+    if norm1 == 0 or norm2 == 0:
+        return 0.0
+    
+    return float(np.dot(vec1, vec2) / (norm1 * norm2))
+
+def calculate_semantic_similarities(incoming_text: str, candidate_texts: List[str]) -> List[float]:
+    """
+    Calculate semantic similarity between incoming error and all candidates.
+    Uses Gemini embeddings if available, falls back to TF-IDF.
+    """
+    if not candidate_texts:
+        return []
+    
+    # Try semantic embeddings first
+    if USE_SEMANTIC_EMBEDDINGS:
+        all_texts = [incoming_text] + candidate_texts
+        embeddings = get_gemini_embeddings(all_texts)
+        
+        if embeddings and len(embeddings) == len(all_texts):
+            incoming_embedding = embeddings[0]
+            candidate_embeddings = embeddings[1:]
+            
+            similarities = [
+                cosine_similarity_vectors(incoming_embedding, ce)
+                for ce in candidate_embeddings
+            ]
+            return similarities
+    
+    # Fallback to TF-IDF
+    corpus = [incoming_text or ""] + [t or "" for t in candidate_texts]
+    try:
+        vectorizer = TfidfVectorizer(ngram_range=(1, 2), stop_words="english", min_df=1, max_df=0.95)
+        tfidf_matrix = vectorizer.fit_transform(corpus)
+        incoming_vector = tfidf_matrix[0]
+        candidate_vectors = tfidf_matrix[1:]
+        similarities = cosine_similarity(incoming_vector, candidate_vectors)[0]
+        return list(similarities)
+    except Exception:
+        return [0.0] * len(candidate_texts)
     
     if release_stage:
         stage = release_stage.upper()
@@ -293,11 +452,15 @@ def passes_hard_gates(incoming: Dict[str, Any], candidate: Dict[str, Any]) -> tu
 # --- 4. SCORING LOGIC ---
 
 def calculate_stack_score(incoming: Dict, candidate: Dict) -> Dict[str, Any]:
-    """Enhanced stack trace comparison with overlap percentage"""
+    """
+    Enhanced stack trace comparison with overlap percentage.
+    Applies penalties for generic/minified frames.
+    """
     score = 0
     reasons = []
     signals = []
     stack_overlap = 0
+    frame_quality = 'medium'
     
     incoming_frames = incoming.get('stack_frames', [])
     candidate_frames = candidate.get('stack_frames', [])
@@ -318,6 +481,11 @@ def calculate_stack_score(incoming: Dict, candidate: Dict) -> Dict[str, Any]:
     inc_frames = select_frames(incoming_frames)
     cand_frames = select_frames(candidate_frames)
     
+    # Check if top frame is generic/minified
+    top_frame_str = incoming.get('top_frame', '')
+    frame_quality = get_frame_quality(top_frame_str)
+    is_generic = frame_quality == 'low'
+    
     # Calculate overlap percentage
     if inc_frames and cand_frames:
         inc_files = set(f['file'] for f in inc_frames)
@@ -328,39 +496,68 @@ def calculate_stack_score(incoming: Dict, candidate: Dict) -> Dict[str, Any]:
     
     matched_files = set()
     
-    # Top frame match (most important)
+    # Top frame match (most important - but penalize generic frames)
     if inc_frames and cand_frames:
         if inc_frames[0]['file'] == cand_frames[0]['file']:
-            score += 20
             top_file = inc_frames[0]['file'].replace('.js', '')
-            reasons.append(f"Top frame ({top_file}) matches")
-            signals.append('top_frame')
+            
+            if is_generic:
+                # Generic frames get minimal score - they're unreliable
+                score += 5  # Was 20
+                reasons.append(f"Top frame ({top_file}) matches (⚠️ generic/minified)")
+                # Don't add 'top_frame' signal for generic frames
+            else:
+                score += 20
+                reasons.append(f"Top frame ({top_file}) matches")
+                signals.append('top_frame')
+            
             matched_files.add(inc_frames[0]['file'])
             
-            # Line number match bonus
+            # Line number match bonus - less valuable for generic frames
             if inc_frames[0].get('line') and cand_frames[0].get('line'):
                 if inc_frames[0]['line'] == cand_frames[0]['line']:
-                    score += 5
-                    reasons.append("Exact line number match")
+                    if is_generic and inc_frames[0]['line'] == 1:
+                        # Line 1 on generic bundle = worthless
+                        score += 0
+                        reasons.append("Line 1 match (ignored - likely minified)")
+                    elif is_generic:
+                        score += 2  # Reduced bonus
+                        reasons.append("Exact line number match (generic frame)")
+                    else:
+                        score += 5
+                        reasons.append("Exact line number match")
         
         # Secondary frame match
         if len(inc_frames) > 1 and len(cand_frames) > 1:
             if inc_frames[1]['file'] == cand_frames[1]['file']:
-                score += 10
-                reasons.append(f"Secondary frame match: {inc_frames[1]['file']}")
+                secondary_generic = is_generic_frame(inc_frames[1]['file'], inc_frames[1].get('line'))
+                if secondary_generic:
+                    score += 3  # Reduced from 10
+                    reasons.append(f"Secondary frame match: {inc_frames[1]['file']} (generic)")
+                else:
+                    score += 10
+                    reasons.append(f"Secondary frame match: {inc_frames[1]['file']}")
                 matched_files.add(inc_frames[1]['file'])
         
-        # Stack overlap bonus
+        # Stack overlap bonus - reduced for generic stacks
         if stack_overlap >= 80:
-            score += 15
-            signals.append('stack')
-            reasons.append(f"High stack similarity ({stack_overlap}%)")
+            if is_generic:
+                score += 5  # Was 15
+                reasons.append(f"High stack similarity ({stack_overlap}%) (⚠️ generic stack)")
+            else:
+                score += 15
+                signals.append('stack')
+                reasons.append(f"High stack similarity ({stack_overlap}%)")
         elif stack_overlap >= 50:
-            score += 8
-            signals.append('stack')
-            reasons.append(f"Moderate stack similarity ({stack_overlap}%)")
+            if is_generic:
+                score += 3  # Was 8
+                reasons.append(f"Moderate stack similarity ({stack_overlap}%) (generic)")
+            else:
+                score += 8
+                signals.append('stack')
+                reasons.append(f"Moderate stack similarity ({stack_overlap}%)")
         elif stack_overlap > 0:
-            score += 3
+            score += 2 if is_generic else 3
             reasons.append(f"Some stack overlap ({stack_overlap}%)")
 
     return {
@@ -368,7 +565,8 @@ def calculate_stack_score(incoming: Dict, candidate: Dict) -> Dict[str, Any]:
         "reasons": reasons,
         "signals": signals,
         "stack_overlap": stack_overlap,
-        "top_frame": incoming.get('top_frame')
+        "top_frame": incoming.get('top_frame'),
+        "frame_quality": frame_quality
     }
 
 def calculate_message_score(message_similarity: float) -> Dict[str, Any]:
@@ -603,27 +801,37 @@ def run_pipeline(incoming_raw, candidates_raw):
     incoming_entry = normalize_incoming_entry(incoming_raw)
     candidate_entries = [normalize_veoci_entry(c) for c in candidates_raw]
     
+    # Detect if incoming has generic stack frame
+    incoming_frame_quality = get_frame_quality(incoming_entry.get('top_frame', ''))
+    has_generic_stack = incoming_frame_quality == 'low'
+    
     # Hard Gates & Corpus Building
     eligible_candidates = []
-    corpus = [incoming_entry["error_message"] or ""]
+    candidate_messages = []
     
     for candidate in candidate_entries:
         passed, _ = passes_hard_gates(incoming_entry, candidate)
         if passed:
-            corpus.append(candidate["error_message"] or "")
+            # Additional soft gate: when stack is generic, prefer same error_type
+            # (don't hard-block, but we'll use this info in scoring)
+            candidate['_error_type_match'] = (
+                incoming_entry.get('error_type') == candidate.get('error_type')
+            )
+            candidate_messages.append(candidate["error_message"] or "")
             eligible_candidates.append(candidate)
-            
-    # TF-IDF
-    message_similarities = []
-    if len(corpus) > 1:
-        try:
-            vectorizer = TfidfVectorizer(ngram_range=(1, 2), stop_words="english", min_df=1, max_df=0.95)
-            tfidf_matrix = vectorizer.fit_transform(corpus)
-            incoming_vector = tfidf_matrix[0]
-            candidate_vectors = tfidf_matrix[1:]
-            message_similarities = cosine_similarity(incoming_vector, candidate_vectors)[0]
-        except Exception:
-            message_similarities = [0.0] * len(eligible_candidates)
+    
+    # Calculate message similarities (semantic or TF-IDF)
+    incoming_message = incoming_entry["error_message"] or ""
+    
+    if eligible_candidates:
+        message_similarities = calculate_semantic_similarities(
+            incoming_message, 
+            candidate_messages
+        )
+        
+        # Log which method was used
+        method_used = "Gemini embeddings" if USE_SEMANTIC_EMBEDDINGS else "TF-IDF"
+        print(f"Using {method_used} for message similarity", file=sys.stderr)
     else:
         message_similarities = []
     
@@ -631,14 +839,39 @@ def run_pipeline(incoming_raw, candidates_raw):
     results = []
     for i, candidate in enumerate(eligible_candidates):
         raw_msg_sim = message_similarities[i] if i < len(message_similarities) else 0.0
+        
+        # When stack is generic, require higher message similarity for high scores
+        if has_generic_stack and raw_msg_sim < 0.5 and not candidate.get('_error_type_match', False):
+            # Apply a penalty - generic stack + weak message = unreliable match
+            raw_msg_sim = raw_msg_sim * 0.5  # Halve the contribution
+        
         result = calculate_total_score(incoming_entry, candidate, raw_msg_sim)
+        
+        # Add error type match bonus/penalty
+        if has_generic_stack:
+            if candidate.get('_error_type_match', False):
+                result['final_score'] = min(100, result['final_score'] + 5)
+                result['reasons'].append(f"Error type match ({incoming_entry.get('error_type')})")
+            else:
+                result['final_score'] = max(0, result['final_score'] - 10)
+                result['reasons'].append(f"Error type mismatch: {incoming_entry.get('error_type')} vs {candidate.get('error_type')}")
+        
         if result['final_score'] > 0:
             results.append(result)
             
     results.sort(key=lambda x: x['final_score'], reverse=True)
     
     # Generate Report
-    return generate_triage_report(results, len(eligible_candidates))
+    report = generate_triage_report(results, len(eligible_candidates))
+    
+    # Add metadata about matching method
+    report['metadata'] = {
+        'similarity_method': 'semantic_embeddings' if USE_SEMANTIC_EMBEDDINGS else 'tfidf',
+        'incoming_frame_quality': incoming_frame_quality,
+        'generic_stack_detected': has_generic_stack
+    }
+    
+    return report
 
 if __name__ == "__main__":
     try:
