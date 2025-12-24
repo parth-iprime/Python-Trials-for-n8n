@@ -1,5 +1,5 @@
 {
-  "name": "Parth's PLayground",
+  "name": "Bugsnag PLayground",
   "nodes": [
     {
       "parameters": {
@@ -8,7 +8,7 @@
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        -896,
+        -832,
         368
       ],
       "id": "a2bb2827-906a-4b3f-b68d-359744894399",
@@ -42,8 +42,8 @@
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.3,
       "position": [
-        -1072,
-        368
+        -1024,
+        144
       ],
       "id": "8d9c2691-d824-4181-9083-05068b5add30",
       "name": "HTTP Request"
@@ -57,40 +57,7 @@
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        304,
-        512
-      ]
-    },
-    {
-      "parameters": {
-        "conditions": {
-          "options": {
-            "caseSensitive": true,
-            "leftValue": "",
-            "typeValidation": "strict",
-            "version": 1
-          },
-          "conditions": [
-            {
-              "id": "c1f7b3a0-1234-4567-8901-condition001",
-              "leftValue": "={{ $json.processedEntry.severity }}",
-              "rightValue": "error",
-              "operator": {
-                "type": "string",
-                "operation": "equals"
-              }
-            }
-          ],
-          "combinator": "and"
-        },
-        "options": {}
-      },
-      "id": "23638ef6-2db6-495e-a69a-7af7c1f14fbc",
-      "name": "Is High Priority Error?",
-      "type": "n8n-nodes-base.if",
-      "typeVersion": 2,
-      "position": [
-        32,
+        128,
         368
       ]
     },
@@ -127,15 +94,15 @@
     },
     {
       "parameters": {
-        "jsCode": "// Prepare data for posting AI analysis to Veoci room\\nconst data = $input.first()?.json;\\nconst aiAnalysis = data?.aiAnalysis;\\nconst errorInfo = data?.errorInfo || data?.processedEntry;\\n\\nconsole.log('Preparing Veoci room message');\\nconsole.log('Analysis type:', aiAnalysis?.analysisType);\\nconsole.log('Has related issues:', aiAnalysis?.hasRelatedIssues);\\n\\n// Get the HTML analysis report\\nconst htmlMessage = aiAnalysis?.htmlReport || aiAnalysis?.htmlAnalysis || '<div>No analysis report available</div>';\\n\\n// Get the original entry ID from webhook or processedEntry\\nlet originalEntryId;\\ntry {\\n    originalEntryId = $('Webhook').first().json.body?.id || data?.processedEntry?.id || 'unknown';\\n} catch (e) {\\n    originalEntryId = data?.processedEntry?.id || errorInfo?.id || 'unknown';\\n}\\nconst threadId = `sosobject-${originalEntryId}`;\\n\\n// Generate timestamp for the API call\\nconst timestamp = Date.now();\\n\\n// Prepare the API URL with timestamp\\nconst apiUrl = `https://veoci.com/api/v2/classic/v1/rooms/67813/messages?timestamp=${timestamp}`;\\n\\nconsole.log('Veoci API Details:');\\nconsole.log('- URL:', apiUrl);\\nconsole.log('- Thread ID:', threadId);\\nconsole.log('- Message length:', htmlMessage.length);\\nconsole.log('- Original Entry ID:', originalEntryId);\\n\\n// Return the prepared data for the HTTP node (must be array)\\nreturn [{\\n  json: {\\n    apiUrl: apiUrl,\\n    formData: {\\n      message: htmlMessage,\\n      thread: threadId,\\n      web: 'true',\\n      mobile: 'false',\\n      important: 'false'\\n    },\\n    metadata: {\\n      originalEntryId: originalEntryId,\\n      threadId: threadId,\\n      timestamp: timestamp,\\n      messageLength: htmlMessage.length,\\n      hasRelatedIssues: aiAnalysis?.hasRelatedIssues || false\\n    }\\n  }\\n}];"
+        "jsCode": "// Prepare data for posting AI analysis to Veoci room\nconst data = $input.first()?.json;\nconst aiAnalysis = data?.aiAnalysis;\nconst errorInfo = data?.errorInfo || data?.processedEntry;\n\nconsole.log('Preparing Veoci room message');\nconsole.log('Analysis type:', aiAnalysis?.analysisType);\nconsole.log('Has related issues:', aiAnalysis?.hasRelatedIssues);\n\n// Get the HTML analysis report\nconst htmlMessage = aiAnalysis?.htmlReport || aiAnalysis?.htmlAnalysis || '<div>No analysis report available</div>';\n\n// Get the original entry ID from webhook or processedEntry\nlet originalEntryId;\ntry {\n    originalEntryId = $('Webhook').first().json.body?.id || data?.processedEntry?.id || 'unknown';\n} catch (e) {\n    originalEntryId = data?.processedEntry?.id || errorInfo?.id || 'unknown';\n}\nconst threadId = `sosobject-${originalEntryId}`;\n\n// Generate timestamp for the API call\nconst timestamp = Date.now();\n\n// Prepare the API URL with timestamp\nconst apiUrl = `https://veoci.com/api/v2/classic/v1/rooms/67813/messages?timestamp=${timestamp}`;\n\nconsole.log('Veoci API Details:');\nconsole.log('- URL:', apiUrl);\nconsole.log('- Thread ID:', threadId);\nconsole.log('- Message length:', htmlMessage.length);\nconsole.log('- Original Entry ID:', originalEntryId);\n\n// Return the prepared data for the HTTP node (must be array)\nreturn [{\n  json: {\n    apiUrl: apiUrl,\n    formData: {\n      message: htmlMessage,\n      thread: threadId,\n      web: 'true',\n      mobile: 'false',\n      important: 'false'\n    },\n    metadata: {\n      originalEntryId: originalEntryId,\n      threadId: threadId,\n      timestamp: timestamp,\n      messageLength: htmlMessage.length,\n      hasRelatedIssues: aiAnalysis?.hasRelatedIssues || false\n    }\n  }\n}];"
       },
       "id": "0cbfa3bc-b8c3-4772-b9ba-db887c476416",
       "name": "Prepare Veoci Message",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        512,
-        336
+        496,
+        368
       ]
     },
     {
@@ -203,7 +170,7 @@
         "genericAuthType": "oAuth2Api",
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={\n  \"append\": false,\n  \"values\": {\n     \"1\": {\n      \"data\": { \"value\": {{ JSON.stringify($('Prepare Veoci Message').item.json.formData.message) }} }\n    \n  }\n}\n}\n",
+        "jsonBody": "={\n  \"append\": false,\n  \"values\": {\n     \"1\": {\n      \"data\": { \"value\":{{ $json.formData.message }} }\n  }\n}\n}\n",
         "options": {}
       },
       "id": "fe1e36ca-8f1a-4181-a47a-3fed608d6065",
@@ -211,29 +178,30 @@
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
       "position": [
-        832,
-        336
+        816,
+        368
       ],
       "credentials": {
         "oAuth2Api": {
           "id": "oBfFTGuXv3yz5ubf",
           "name": "Parth"
         }
-      },
-      "disabled": true
+      }
     },
     {
       "parameters": {
-        "jsCode": "// High priority error processing logic with AI HTML analysis\nconst data = $input.first()?.json;\nconst aiAnalysis = data?.aiAnalysis;\n\nconsole.log('Processing high priority error:', data?.processedEntry?.errorMessage || 'Unknown error');\nconsole.log('AI Analysis Type:', aiAnalysis?.analysisType);\nconsole.log('AI Analysis - Related Issues:', aiAnalysis?.hasRelatedIssues);\n\n// Enhanced processing logic based on AI pattern analysis\nlet processingAction = 'high_priority_processing';\nlet recommendations = [\n  'Immediate investigation required',\n  'Check for widespread impact',\n  'Consider hotfix deployment'\n];\n\n// Modify recommendations based on AI pattern findings\nif (aiAnalysis?.hasRelatedIssues) {\n  processingAction = 'high_priority_pattern_detected';\n  recommendations.unshift('⚠️ RELATED PATTERN DETECTED - Broader investigation recommended');\n  recommendations.push('📋 Review detailed HTML analysis report for specific relationships');\n  recommendations.push('🔗 Check linked entries in the analysis report');\n  recommendations.push('🏷️ Consider creating an epic to track this error pattern');\n  recommendations.push('📞 Escalate to senior developer for pattern review');\n} else {\n  recommendations.push('✅ No related patterns detected - treat as isolated incident');\n}\n\n// Include the HTML analysis report in the response\nconst htmlReport = aiAnalysis?.htmlAnalysis || '<div>No analysis report available</div>';\n\nreturn {\n  json: {\n    action: processingAction,\n    errorInfo: data.processedEntry,\n    aiAnalysis: {\n      hasRelatedIssues: aiAnalysis?.hasRelatedIssues || false,\n      analysisType: aiAnalysis?.analysisType || 'unknown',\n      htmlReport: htmlReport,\n      reportLength: htmlReport.length\n    },\n    alertLevel: 'URGENT',\n    timestamp: new Date().toISOString(),\n    recommendations: recommendations,\n    nextActions: [\n      'Review HTML analysis report for pattern details',\n      'Investigate all linked related entries',\n      'Assess if this requires immediate hotfix',\n      'Document findings for future reference'\n    ]\n  }\n};"
+        "content": "This is a call to python file hosted on the server for repo  https://github.com/parth-iprime/Python-Trials-for-n8n\n\nRequired file to review dedupiicate",
+        "height": 272,
+        "width": 416
       },
-      "id": "bcca4cef-8861-4f09-af6f-b5c3cf4afb13",
-      "name": "High Priority Alert",
-      "type": "n8n-nodes-base.code",
-      "typeVersion": 2,
+      "type": "n8n-nodes-base.stickyNote",
       "position": [
-        256,
-        224
-      ]
+        -1200,
+        0
+      ],
+      "typeVersion": 1,
+      "id": "b6363956-04a4-4b1c-8cc0-834de0b6a0dc",
+      "name": "Sticky Note"
     }
   ],
   "pinData": {
@@ -80657,29 +80625,11 @@
         ]
       ]
     },
-    "Is High Priority Error?": {
-      "main": [
-        [
-          {
-            "node": "High Priority Alert",
-            "type": "main",
-            "index": 0
-          }
-        ],
-        [
-          {
-            "node": "Standard Processing",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
     "Process HTML Report": {
       "main": [
         [
           {
-            "node": "Is High Priority Error?",
+            "node": "Standard Processing",
             "type": "main",
             "index": 0
           }
@@ -80740,24 +80690,13 @@
           }
         ]
       ]
-    },
-    "High Priority Alert": {
-      "main": [
-        [
-          {
-            "node": "Prepare Veoci Message",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
     }
   },
   "active": false,
   "settings": {
     "executionOrder": "v1"
   },
-  "versionId": "a076dd2b-12d2-4178-b244-7cc036372f6f",
+  "versionId": "3249974c-580a-4507-9be9-779a1c3530df",
   "meta": {
     "templateCredsSetupCompleted": true,
     "instanceId": "2b71f4a8dbc995cc64e9c2d93448c3aeed875e080207645877f62b5f9ff7c63e"
