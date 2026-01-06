@@ -1127,9 +1127,23 @@ def analyze_frequency_trends(incoming: Dict, candidates: List[Dict], related_ent
 # --- 5. MAIN PIPELINE ---
 
 def run_pipeline(incoming_raw, candidates_raw):
-    # Normalize
+    # Normalize incoming
     incoming_entry = normalize_incoming_entry(incoming_raw)
-    candidate_entries = [normalize_veoci_entry(c) for c in candidates_raw]
+    
+    # Extract candidate entries from n8n format if needed
+    # n8n format: [{'json': {'entries': [...], ...}, 'pairedItem': ...}]
+    # Direct format: [entry1, entry2, ...]
+    if candidates_raw and isinstance(candidates_raw, list):
+        first_item = candidates_raw[0] if candidates_raw else {}
+        if isinstance(first_item, dict) and 'json' in first_item:
+            # n8n format - extract entries from nested structure
+            entries_list = first_item.get('json', {}).get('entries', [])
+            candidate_entries = [normalize_veoci_entry(c) for c in entries_list]
+        else:
+            # Direct format - entries are passed directly
+            candidate_entries = [normalize_veoci_entry(c) for c in candidates_raw]
+    else:
+        candidate_entries = []
     
     # CHANGE 1: Classify error mode (INSTANCE vs CLASS)
     error_mode = classify_error_mode(
