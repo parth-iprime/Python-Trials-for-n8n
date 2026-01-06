@@ -261,12 +261,19 @@ def extract_error_type(error_message: str) -> str:
         return "ReferenceError"
     return "Error"
 
-def extract_route(url: str) -> str:
-    """Extract route/path from URL"""
-    if not url:
-        return "/"
+def extract_route(url_or_path: str) -> str:
+    """Extract route/path from URL or path string. Handles 'GET /api/...' format."""
+    if not url_or_path:
+        return None  # Return None instead of "/" so we know it's missing
+    
+    # Strip HTTP method prefix if present (e.g., "GET /api/v2/me/keepAlive")
+    route_str = url_or_path.strip()
+    method_match = re.match(r'^(GET|POST|PUT|DELETE|PATCH|OPTIONS|HEAD)\s+(.+)$', route_str, re.IGNORECASE)
+    if method_match:
+        route_str = method_match.group(2)
+    
     try:
-        parsed = urlparse(url)
+        parsed = urlparse(route_str)
         path = parsed.path or "/"
         # Remove common prefixes and clean up
         path = re.sub(r'^/v/c/\d+', '', path)  # Veoci-specific cleanup
@@ -473,6 +480,7 @@ def normalize_veoci_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
     browser = get_val('16')
     ua_string = get_val('13')
     request_url = get_val('39')
+    error_url = get_val('6')  # Route like "GET /api/v2/me/keepAlive"
     stack_trace = get_val('8')
     
     # Parse browser info
@@ -508,11 +516,12 @@ def normalize_veoci_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
         'is_mobile': browser_info['is_mobile'],
         'os_name': get_val('15'),
         'request_url': request_url,
-        'route': extract_route(request_url),
+        # Use field 6 (error_url like "GET /api/...") if request_url (field 39) is empty
+        'route': extract_route(request_url) or extract_route(error_url),
         'environment': normalize_environment(release_stage, app_type),
         'linked_tickets': get_val('24'),   # Linked Veoci Tickets
         'bugsnag_url': get_val('0'),       # Bugsnag URL
-        'error_url': get_val('6')          # Error URL
+        'error_url': error_url             # Error URL (route with method)
     }
 
 def normalize_incoming_entry(entry_wrapper: Any) -> Dict[str, Any]:
@@ -567,7 +576,8 @@ def normalize_incoming_entry(entry_wrapper: Any) -> Dict[str, Any]:
         'is_mobile': browser_info['is_mobile'],
         'os_name': entry.get('15'),
         'request_url': request_url,
-        'route': extract_route(request_url),
+        # Use field 6 (error_url like "GET /api/...") if request_url (field 39) is empty
+        'route': extract_route(request_url) or extract_route(entry.get('6')),
         'environment': normalize_environment(release_stage, app_type),
         'linked_tickets': entry.get('24'),
         'bugsnag_url': entry.get('0'),
@@ -790,15 +800,21 @@ def calculate_environment_score(incoming: Dict, candidate: Dict) -> Dict[str, An
                 score += 3
                 reasons.append("Route prefix match")
     
-    # Client/Browser match
-    if incoming.get('browser_family') and candidate.get('browser_family'):
-        if incoming['browser_family'] == candidate['browser_family']:
+    # Client/Browser match - but "undefined" should not count as a match!
+    inc_browser = incoming.get('browser_family', '')
+    cand_browser = candidate.get('browser_family', '')
+    # Exclude meaningless client values
+    meaningless_clients = ['undefined', 'unknown', '', None, 'null', 'none']
+    if (inc_browser and cand_browser and 
+        inc_browser.lower() not in meaningless_clients and
+        cand_browser.lower() not in meaningless_clients):
+        if inc_browser == cand_browser:
             if incoming.get('browser_version') == candidate.get('browser_version'):
                 score += 5
-                reasons.append(f"Same client family and major version ({incoming['browser_family']} {incoming['browser_version']})")
+                reasons.append(f"Same client family and major version ({inc_browser} {incoming.get('browser_version')})")
             else:
                 score += 3
-                reasons.append(f"Same client family ({incoming['browser_family']}), different version")
+                reasons.append(f"Same client family ({inc_browser}), different version")
             signals.append('client')
     
     # App type match
