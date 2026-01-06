@@ -928,8 +928,24 @@ def generate_triage_report(results: List[Dict[str, Any]], total_candidates: int,
     - Low: score >= 30
     - Below 30: filtered out by default
     """
-    # Filter results by minimum score threshold
-    filtered_results = [r for r in results if r['final_score'] >= min_score]
+    # WEAK SIGNALS that alone are NOT enough to qualify a match
+    # These can boost a score but shouldn't be the only signal
+    WEAK_SIGNALS = {'client', 'temporal'}
+    MEANINGFUL_SIGNALS = {'stack', 'top_frame', 'message', 'env', 'url'}
+    
+    # Filter results by minimum score threshold AND signal quality
+    filtered_results = []
+    for r in results:
+        if r['final_score'] < min_score:
+            continue
+        
+        signals = set(r.get('signals', []))
+        # Require at least one MEANINGFUL signal (not just client/temporal)
+        has_meaningful_signal = bool(signals & MEANINGFUL_SIGNALS)
+        
+        if has_meaningful_signal:
+            filtered_results.append(r)
+        # else: skip entries with only weak signals like "client"
     
     report = {
         "batchSummary": {
