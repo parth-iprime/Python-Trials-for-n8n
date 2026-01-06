@@ -65,13 +65,38 @@ def classify_error_mode(error_message: str, error_type: str) -> str:
 def is_vendor_file(file_path: str) -> bool:
     if not file_path: return False
     vendor_patterns = [
+        # JavaScript/Node vendor patterns
         r"^node_modules/", r"^@vue/", r"vuetify/", r"core-js", r"zone\.js",
         r"runtime-core\.esm-bundler\.js", r"reactivity\.esm-bundler\.js",
         r"proxiedModel\.mjs", r"app\..*\.js", r"vendor\..*\.js", r"chunk-.*\.js",
+        # Java logging frameworks (with package prefix)
         r"LogbackBugsnagAppender\.java", r"AppenderBase\.java",
         r"AppenderAttachableImpl\.java", r"Logger\.java", r"ch\.qos\.logback\.",
         r"org\.springframework\.", r"org\.apache\.commons\.", r"java\.util\.",
-        r"javax?\.", r"sun\.reflect\."
+        r"javax?\.", r"sun\.reflect\.",
+        # Java Spring Framework files (by filename - catches stack traces without package)
+        r"SQLStateSQLExceptionTranslator\.java",
+        r"AbstractFallbackSQLExceptionTranslator\.java",
+        r"SQLErrorCodeSQLExceptionTranslator\.java",
+        r"JdbcTemplate\.java",
+        r"TransactionTemplate\.java",
+        r"DataSourceTransactionManager\.java",
+        r"AbstractPlatformTransactionManager\.java",
+        r"TransactionInterceptor\.java",
+        r"TransactionAspectSupport\.java",
+        # Java servlet/container
+        r"DispatcherServlet\.java",
+        r"FrameworkServlet\.java",
+        r"HttpServlet\.java",
+        r"ApplicationFilterChain\.java",
+        r"StandardWrapperValve\.java",
+        # Java exception handling
+        r"ExceptionHandlerExceptionResolver\.java",
+        r"ExceptionTranslationFilter\.java",
+        # Java thread pool / async
+        r"ThreadPoolExecutor\.java",
+        r"FutureTask\.java",
+        r"CompletableFuture\.java",
     ]
     return any(re.search(p, file_path) for p in vendor_patterns)
 
