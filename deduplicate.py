@@ -947,6 +947,11 @@ def generate_triage_report(results: List[Dict[str, Any]], total_candidates: int,
     # Update relatedFound to reflect ACTUAL capped count shown to user
     report["batchSummary"]["relatedFound"] = len(report["relatedEntries"])
     
+    # RECALCULATE confidence counts based on CAPPED entries only
+    report["batchSummary"]["confidenceCounts"] = {"High": 0, "Medium": 0, "Low": 0}
+    for entry in report["relatedEntries"]:
+        report["batchSummary"]["confidenceCounts"][entry["confidence"]] += 1
+    
     return report
 
 # --- STEP 4: TREND ANALYSIS ---
