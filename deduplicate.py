@@ -29,6 +29,39 @@ if USE_SEMANTIC_EMBEDDINGS:
 
 # --- 1. HELPER FUNCTIONS ---
 
+def classify_error_mode(error_message: str, error_type: str) -> str:
+    """
+    Distinguish between INSTANCE bugs and CLASS (infrastructure/systemic) issues.
+    """
+    msg = (error_message or "").lower()
+    et = (error_type or "").lower()
+
+    infra_keywords = [
+        # Database/SQL
+        'sql connection', 'statementcallback', 'preparedstatementcallback',
+        'connection failure', 'aurora', 'jdbc',
+        'deadlock', 'too many connections', 'connection reset',
+        'resourcefailureexception', 'dataaccessresourcefailure',
+        # Redis/Cache
+        'redis', 'marking redis', 'redis is down', 'redis command timed out',
+        # Monitoring/Alerts
+        'monitoring alert', 'recovered from', 'threshold reached',
+        'critical threshold', 'warning threshold',
+        # Message queues
+        'rabbitmq', 'queue size', 'consumer count',
+        # Network/Timeouts
+        'timeout', 'connection timed out', 'socket timeout',
+        'network error', 'connection refused'
+    ]
+
+    if any(k in msg for k in infra_keywords):
+        return "CLASS"
+
+    if any(k in et for k in ['timeout', 'resource', 'network']):
+        return "CLASS"
+
+    return "INSTANCE"
+
 def is_vendor_file(file_path: str) -> bool:
     if not file_path: return False
     vendor_patterns = [
@@ -535,12 +568,16 @@ def calculate_stack_score(incoming: Dict, candidate: Dict) -> Dict[str, Any]:
     """
     Enhanced stack trace comparison with overlap percentage.
     Applies penalties for generic/minified frames.
+    Throttles score for CLASS (infrastructure) errors.
     """
     score = 0
     reasons = []
     signals = []
     stack_overlap = 0
     frame_quality = 'medium'
+    
+    # Read error mode for CLASS throttling
+    error_mode = incoming.get('_error_mode', 'INSTANCE')
     
     incoming_frames = incoming.get('stack_frames', [])
     candidate_frames = candidate.get('stack_frames', [])
@@ -556,15 +593,19 @@ def calculate_stack_score(incoming: Dict, candidate: Dict) -> Dict[str, Any]:
                 seen.add(f['file'])
                 unique.append(f)
             if len(unique) >= 5: break
-        return unique
+        return unique, len(non_vendor) == 0 and len(vendor) > 0  # Flag if vendor-only
 
-    inc_frames = select_frames(incoming_frames)
-    cand_frames = select_frames(candidate_frames)
+    inc_frames, inc_vendor_only = select_frames(incoming_frames)
+    cand_frames, cand_vendor_only = select_frames(candidate_frames)
+    
+    # CRITICAL: Vendor-only stacks (all logging/framework frames) are NOT meaningful
+    # They indicate infrastructure logging, not actual application code
+    is_vendor_only_stack = inc_vendor_only or cand_vendor_only
     
     # Check if top frame is generic/minified
     top_frame_str = incoming.get('top_frame', '')
     frame_quality = get_frame_quality(top_frame_str)
-    is_generic = frame_quality == 'low'
+    is_generic = frame_quality == 'low' or is_vendor_only_stack
     
     # Calculate overlap percentage
     if inc_frames and cand_frames:
@@ -640,8 +681,22 @@ def calculate_stack_score(incoming: Dict, candidate: Dict) -> Dict[str, Any]:
             score += 2 if is_generic else 3
             reasons.append(f"Some stack overlap ({stack_overlap}%)")
 
+    # Add warning for vendor-only stacks
+    if is_vendor_only_stack:
+        reasons.append("⚠️ Vendor-only stack (logging framework) - low reliability")
+        frame_quality = 'vendor-only'
+
+    # Cap stack score based on error mode (CLASS errors get throttled)
+    # Vendor-only stacks also get heavily throttled
+    if error_mode == "INSTANCE" and not is_vendor_only_stack:
+        max_stack = 50
+    elif is_vendor_only_stack:
+        max_stack = 10  # Vendor-only stacks are nearly meaningless
+    else:
+        max_stack = 20
+    
     return {
-        "score": min(score, 50),
+        "score": min(score, max_stack),
         "reasons": reasons,
         "signals": signals,
         "stack_overlap": stack_overlap,
@@ -649,10 +704,14 @@ def calculate_stack_score(incoming: Dict, candidate: Dict) -> Dict[str, Any]:
         "frame_quality": frame_quality
     }
 
-def calculate_message_score(message_similarity: float) -> Dict[str, Any]:
-    """Score based on error message similarity"""
+def calculate_message_score(message_similarity: float, incoming: Dict = None) -> Dict[str, Any]:
+    """Score based on error message similarity. Penalizes SQL dynamic query differences."""
     signals = []
     reasons = []
+    
+    # Check for SQL-related messages
+    msg_lower = (incoming.get('error_message') or "").lower() if incoming else ""
+    is_sql = 'sql' in msg_lower or 'statementcallback' in msg_lower
     
     # Scale TF-IDF similarity (0-1) to score contribution
     if message_similarity >= 0.9:
@@ -672,6 +731,11 @@ def calculate_message_score(message_similarity: float) -> Dict[str, Any]:
         if message_similarity > 0.1:
             reasons.append(f"Message slightly similar ({message_similarity:.0%})")
     
+    # SQL message entropy penalty - dynamic queries differ
+    if is_sql and message_similarity < 0.6:
+        score = score * 0.5
+        reasons.append("SQL message differs (dynamic query)")
+    
     return {"score": score, "reasons": reasons, "signals": signals}
 
 def calculate_environment_score(incoming: Dict, candidate: Dict) -> Dict[str, Any]:
@@ -689,7 +753,7 @@ def calculate_environment_score(incoming: Dict, candidate: Dict) -> Dict[str, An
     
     # Route/URL match
     if incoming.get('route') and candidate.get('route'):
-        if incoming['route'] == candidate['route']:
+        if incoming['route'] == candidate['route'] and incoming['route'] != '/':
             score += 8
             reasons.append(f"Exact route match ({incoming['route']})")
             signals.append('url')
@@ -762,7 +826,7 @@ def calculate_total_score(incoming: Dict[str, Any], candidate: Dict[str, Any], m
     """
     # Calculate individual scores
     stack_res = calculate_stack_score(incoming, candidate)
-    message_res = calculate_message_score(message_similarity)
+    message_res = calculate_message_score(message_similarity, incoming)
     env_res = calculate_environment_score(incoming, candidate)
     temporal_res = calculate_temporal_score(incoming, candidate)
     
@@ -808,7 +872,8 @@ def calculate_total_score(incoming: Dict[str, Any], candidate: Dict[str, Any], m
         "error_type": candidate.get('error_type'),
         "route": candidate.get('route'),
         "environment": candidate.get('environment'),
-        "linked_tickets": candidate.get('linked_tickets')
+        "linked_tickets": candidate.get('linked_tickets'),
+        "error_mode": incoming.get('_error_mode', 'INSTANCE')
     }
 
 def generate_triage_report(results: List[Dict[str, Any]], total_candidates: int, min_score: int = 0) -> Dict[str, Any]:
@@ -836,14 +901,19 @@ def generate_triage_report(results: List[Dict[str, Any]], total_candidates: int,
     
     for res in filtered_results:
         score = res['final_score']
+        error_mode = res.get('error_mode', 'INSTANCE')
         
-        # Adjusted confidence thresholds
-        if score >= 70:
-            confidence = "High"
-        elif score >= 50:
-            confidence = "Medium"
+        # CLASS mode can NEVER be High confidence
+        if error_mode == "CLASS":
+            confidence = "Low"  # Infrastructure errors always Low
         else:
-            confidence = "Low"
+            # Adjusted confidence thresholds for INSTANCE errors
+            if score >= 70:
+                confidence = "High"
+            elif score >= 50:
+                confidence = "Medium"
+            else:
+                confidence = "Low"
         
         report["batchSummary"]["confidenceCounts"][confidence] += 1
         
@@ -865,12 +935,17 @@ def generate_triage_report(results: List[Dict[str, Any]], total_candidates: int,
             "errorType": res.get('error_type'),
             "route": res.get('route'),
             "environment": res.get('environment'),
-            "linkedTickets": res.get('linked_tickets')
+            "linkedTickets": res.get('linked_tickets'),
+            "errorMode": res.get('error_mode')
         }
         report["relatedEntries"].append(entry)
     
-    # Limit to top 20 matches to keep response manageable
-    report["relatedEntries"] = report["relatedEntries"][:20]
+    # HARD CAP: Limit to top 10 matches (non-negotiable)
+    MAX_RELATED = 10
+    report["relatedEntries"] = report["relatedEntries"][:MAX_RELATED]
+    
+    # Update relatedFound to reflect ACTUAL capped count shown to user
+    report["batchSummary"]["relatedFound"] = len(report["relatedEntries"])
     
     return report
 
@@ -994,6 +1069,13 @@ def run_pipeline(incoming_raw, candidates_raw):
     incoming_entry = normalize_incoming_entry(incoming_raw)
     candidate_entries = [normalize_veoci_entry(c) for c in candidates_raw]
     
+    # CHANGE 1: Classify error mode (INSTANCE vs CLASS)
+    error_mode = classify_error_mode(
+        incoming_entry.get('error_message'),
+        incoming_entry.get('error_type')
+    )
+    incoming_entry['_error_mode'] = error_mode
+    
     # Detect if incoming has generic stack frame
     incoming_frame_quality = get_frame_quality(incoming_entry.get('top_frame', ''))
     has_generic_stack = incoming_frame_quality == 'low'
@@ -1039,6 +1121,9 @@ def run_pipeline(incoming_raw, candidates_raw):
             raw_msg_sim = raw_msg_sim * 0.5  # Halve the contribution
         
         result = calculate_total_score(incoming_entry, candidate, raw_msg_sim)
+        
+        # Propagate error_mode into results
+        result['error_mode'] = error_mode
         
         # Add error type match bonus/penalty
         if has_generic_stack:
