@@ -310,6 +310,27 @@ def parse_browser_info(browser: str, ua_string: str) -> Dict[str, Any]:
 def normalize_environment(release_stage: str, app_type: str) -> str:
     """Normalize environment string (e.g., PROD-MOBILE)"""
     env_parts = []
+    
+    if release_stage:
+        stage = release_stage.upper()
+        if 'PROD' in stage or 'PRODUCTION' in stage:
+            env_parts.append('PROD')
+        elif 'STAG' in stage:
+            env_parts.append('STAGING')
+        elif 'DEV' in stage:
+            env_parts.append('DEV')
+        else:
+            env_parts.append(stage)
+    
+    if app_type:
+        if 'mobile' in app_type.lower():
+            env_parts.append('MOBILE')
+        elif 'client' in app_type.lower():
+            env_parts.append('WEB')
+        elif 'api' in app_type.lower():
+            env_parts.append('API')
+            
+    return '-'.join(env_parts) if env_parts else None
 
 # --- SEMANTIC EMBEDDINGS ---
 
@@ -391,27 +412,6 @@ def calculate_semantic_similarities(incoming_text: str, candidate_texts: List[st
         return list(similarities)
     except Exception:
         return [0.0] * len(candidate_texts)
-    
-    if release_stage:
-        stage = release_stage.upper()
-        if 'PROD' in stage or 'PRODUCTION' in stage:
-            env_parts.append('PROD')
-        elif 'STAG' in stage:
-            env_parts.append('STAGING')
-        elif 'DEV' in stage:
-            env_parts.append('DEV')
-        else:
-            env_parts.append(stage)
-    
-    if app_type:
-        if 'mobile' in app_type.lower():
-            env_parts.append('MOBILE')
-        elif 'client' in app_type.lower():
-            env_parts.append('WEB')
-        elif 'api' in app_type.lower():
-            env_parts.append('API')
-            
-    return '-'.join(env_parts) if env_parts else None
 
 def parse_stack_frames(input_str: Any) -> List[Dict[str, Any]]:
     if not input_str or not isinstance(input_str, str): return []
