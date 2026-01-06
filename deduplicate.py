@@ -7,8 +7,10 @@ import numpy as np
 from typing import List, Dict, Any, Tuple
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
-from datetime import datetime
+from datetime import datetime, timedelta
 from urllib.parse import urlparse
+from difflib import SequenceMatcher
+from collections import Counter
 
 # Gemini embeddings (optional - falls back to TF-IDF if not configured)
 try:
@@ -101,6 +103,84 @@ def get_frame_quality(top_frame: str) -> str:
         return 'high'
     
     return 'medium'
+
+# --- STEP 3: FUZZY MATCHING FUNCTIONS ---
+
+def fuzzy_match_score(str1: str, str2: str) -> float:
+    """
+    Calculate fuzzy match score between two strings (0.0 to 1.0).
+    Uses SequenceMatcher for character-level similarity.
+    """
+    if not str1 or not str2:
+        return 0.0
+    
+    # Normalize strings: lowercase, remove extra whitespace
+    s1 = ' '.join(str1.lower().strip().split())
+    s2 = ' '.join(str2.lower().strip().split())
+    
+    if s1 == s2:
+        return 1.0
+    
+    # Use SequenceMatcher for fuzzy matching
+    matcher = SequenceMatcher(None, s1, s2)
+    return matcher.ratio()
+
+def extract_error_core_message(error_msg: str) -> str:
+    """
+    Extract the core error message by removing timestamps, URLs, and variable names.
+    This allows better fuzzy matching of similar errors.
+    """
+    if not error_msg:
+        return ""
+    
+    msg = error_msg
+    
+    # Remove common prefixes (timestamps, dates)
+    msg = re.sub(r'^[A-Z][a-z]{2}\s+[A-Z][a-z]{2}\s+\d{1,2}\s+\d{4}\s+[\d:]+\s+GMT[+-]\d{4}\s+\([^)]+\):\s*', '', msg)
+    
+    # Remove URLs
+    msg = re.sub(r'https?://[^\s]+', '[URL]', msg)
+    
+    # Remove entry/form IDs (common in Veoci errors)
+    msg = re.sub(r'\b\d{7,}\b', '[ID]', msg)
+    
+    # Remove variable-specific names but keep structure
+    msg = re.sub(r"'[^']*'", '[VAR]', msg)
+    msg = re.sub(r'"[^"]*"', '[VAR]', msg)
+    
+    return msg.strip()
+
+def categorize_error_type(error_msg: str) -> str:
+    """
+    Categorize errors into common groups for better matching.
+    Returns category name.
+    """
+    if not error_msg:
+        return "Unknown"
+    
+    msg_lower = error_msg.lower()
+    
+    # Authentication/Session
+    if any(keyword in msg_lower for keyword in ['logged out', 'login', 'auth', 'token', 'session', 'sso', 'firebase']):
+        return "Authentication"
+    
+    # Network/API
+    if any(keyword in msg_lower for keyword in ['network error', 'fetch fail', 'timeout', 'api', 'request failed']):
+        return "Network"
+    
+    # Null/Undefined errors
+    if any(keyword in msg_lower for keyword in ['null is not', 'undefined is not', 'cannot read propert', 'cannot set propert']):
+        return "Null Reference"
+    
+    # Loading/Resource errors
+    if any(keyword in msg_lower for keyword in ['loading chunk', 'failed to load', "didn't start", 'chunk fail']):
+        return "Resource Loading"
+    
+    # UI/Rendering
+    if any(keyword in msg_lower for keyword in ['dashboard', 'tiles', 'render', 'leaflet', 'map', 'dialog']):
+        return "UI/Rendering"
+    
+    return "Other"
 
 def extract_error_type(error_message: str) -> str:
     """Extract error type from error message (e.g., TypeError, Error, ReferenceError)"""
@@ -794,6 +874,119 @@ def generate_triage_report(results: List[Dict[str, Any]], total_candidates: int,
     
     return report
 
+# --- STEP 4: TREND ANALYSIS ---
+
+def analyze_frequency_trends(incoming: Dict, candidates: List[Dict], related_entries: List[Dict]) -> Dict[str, Any]:
+    """
+    Analyze frequency and trends of similar errors over time.
+    Returns insights about error patterns, spikes, and affected users.
+    """
+    
+    # Extract incoming error details
+    inc_msg_core = extract_error_core_message(incoming.get('error_message', ''))
+    inc_category = categorize_error_type(incoming.get('error_message', ''))
+    
+    # Filter candidates to similar errors (same category or similar message)
+    similar_errors = []
+    for cand in candidates:
+        cand_msg = cand.get('error_message', '')
+        cand_msg_core = extract_error_core_message(cand_msg)
+        cand_category = categorize_error_type(cand_msg)
+        
+        # Check if similar
+        if cand_category == inc_category or fuzzy_match_score(inc_msg_core, cand_msg_core) > 0.6:
+            similar_errors.append(cand)
+    
+    # Time-based analysis
+    now = datetime.utcnow()
+    time_buckets = {
+        'last_24h': [],
+        'last_7d': [],
+        'last_30d': []
+    }
+    
+    for error in similar_errors:
+        try:
+            # Parse timestamp (milliseconds)
+            timestamp_val = error.get('timestamp')
+            if timestamp_val:
+                if isinstance(timestamp_val, str):
+                    if timestamp_val.endswith('Z'):
+                        error_time = datetime.fromisoformat(timestamp_val[:-1])
+                    else:
+                        error_time = datetime.fromisoformat(timestamp_val)
+                else:
+                    # Assume milliseconds timestamp
+                    error_time = datetime.utcfromtimestamp(int(timestamp_val) / 1000)
+                
+                time_diff = now - error_time
+                
+                if time_diff <= timedelta(hours=24):
+                    time_buckets['last_24h'].append(error)
+                if time_diff <= timedelta(days=7):
+                    time_buckets['last_7d'].append(error)
+                if time_diff <= timedelta(days=30):
+                    time_buckets['last_30d'].append(error)
+        except:
+            pass
+    
+    # Daily breakdown for last 7 days
+    daily_counts = {}
+    for error in time_buckets['last_7d']:
+        try:
+            timestamp_val = error.get('timestamp')
+            if timestamp_val:
+                if isinstance(timestamp_val, str):
+                    if timestamp_val.endswith('Z'):
+                        error_time = datetime.fromisoformat(timestamp_val[:-1])
+                    else:
+                        error_time = datetime.fromisoformat(timestamp_val)
+                else:
+                    error_time = datetime.utcfromtimestamp(int(timestamp_val) / 1000)
+                
+                date_key = error_time.strftime('%b %d')
+                daily_counts[date_key] = daily_counts.get(date_key, 0) + 1
+        except:
+            pass
+    
+    # Detect spike (compare last 24h to previous days)
+    avg_daily_last_week = len(time_buckets['last_7d']) / 7 if time_buckets['last_7d'] else 0
+    count_last_24h = len(time_buckets['last_24h'])
+    
+    is_spike = count_last_24h > (avg_daily_last_week * 2) and count_last_24h > 3
+    spike_percentage = ((count_last_24h / avg_daily_last_week) - 1) * 100 if avg_daily_last_week > 0 else 0
+    
+    # Affected users (extract from error messages or user fields)
+    affected_users = set()
+    for error in similar_errors:
+        msg = error.get('error_message', '')
+        # Extract email patterns
+        emails = re.findall(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b', msg)
+        affected_users.update(emails)
+    
+    # Environment breakdown
+    env_counts = Counter()
+    for error in similar_errors:
+        env = error.get('environment', 'Unknown')
+        if env:
+            env_counts[env] += 1
+    
+    return {
+        'total_similar': len(similar_errors),
+        'counts': {
+            'last_24h': len(time_buckets['last_24h']),
+            'last_7d': len(time_buckets['last_7d']),
+            'last_30d': len(time_buckets['last_30d'])
+        },
+        'daily_breakdown': dict(sorted(daily_counts.items())),
+        'spike_detected': is_spike,
+        'spike_percentage': round(spike_percentage, 1) if spike_percentage else 0,
+        'affected_users': list(affected_users)[:10],  # Top 10
+        'affected_users_count': len(affected_users),
+        'environment_breakdown': dict(env_counts.most_common(5)),
+        'category': inc_category
+    }
+
 # --- 5. MAIN PIPELINE ---
 
 def run_pipeline(incoming_raw, candidates_raw):
@@ -863,6 +1056,11 @@ def run_pipeline(incoming_raw, candidates_raw):
     
     # Generate Report
     report = generate_triage_report(results, len(eligible_candidates))
+    
+    # Add trend analysis
+    related_entries = report.get('relatedEntries', [])
+    trend_analysis = analyze_frequency_trends(incoming_entry, candidate_entries, related_entries)
+    report['trendAnalysis'] = trend_analysis
     
     # Add metadata about matching method
     report['metadata'] = {
