@@ -12,21 +12,6 @@ from urllib.parse import urlparse
 from difflib import SequenceMatcher
 from collections import Counter
 
-# Gemini embeddings (optional - falls back to TF-IDF if not configured)
-try:
-    import google.generativeai as genai
-    GEMINI_AVAILABLE = True
-except ImportError:
-    GEMINI_AVAILABLE = False
-    genai = None
-
-# Configuration
-GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
-USE_SEMANTIC_EMBEDDINGS = GEMINI_AVAILABLE and GEMINI_API_KEY is not None
-
-if USE_SEMANTIC_EMBEDDINGS:
-    genai.configure(api_key=GEMINI_API_KEY)
-
 # --- 1. HELPER FUNCTIONS ---
 
 def classify_error_mode(error_message: str, error_type: str) -> str:
@@ -332,76 +317,15 @@ def normalize_environment(release_stage: str, app_type: str) -> str:
             
     return '-'.join(env_parts) if env_parts else None
 
-# --- SEMANTIC EMBEDDINGS ---
-
-def get_gemini_embeddings(texts: List[str]) -> List[List[float]]:
-    """
-    Get embeddings for a list of texts using Gemini's text-embedding-004 model.
-    Returns list of embedding vectors.
-    """
-    if not USE_SEMANTIC_EMBEDDINGS or not texts:
-        return []
-    
-    embeddings = []
-    try:
-        for text in texts:
-            if not text or not text.strip():
-                # Return zero vector for empty text
-                embeddings.append([0.0] * 768)  # text-embedding-004 dimension
-                continue
-            
-            result = genai.embed_content(
-                model="models/text-embedding-004",
-                content=text,
-                task_type="SEMANTIC_SIMILARITY"
-            )
-            embeddings.append(result['embedding'])
-    except Exception as e:
-        print(f"Warning: Gemini embedding failed: {e}", file=sys.stderr)
-        return []
-    
-    return embeddings
-
-def cosine_similarity_vectors(vec1: List[float], vec2: List[float]) -> float:
-    """Calculate cosine similarity between two vectors."""
-    if not vec1 or not vec2:
-        return 0.0
-    
-    vec1 = np.array(vec1)
-    vec2 = np.array(vec2)
-    
-    norm1 = np.linalg.norm(vec1)
-    norm2 = np.linalg.norm(vec2)
-    
-    if norm1 == 0 or norm2 == 0:
-        return 0.0
-    
-    return float(np.dot(vec1, vec2) / (norm1 * norm2))
+# --- TEXT SIMILARITY (TF-IDF) ---
 
 def calculate_semantic_similarities(incoming_text: str, candidate_texts: List[str]) -> List[float]:
     """
-    Calculate semantic similarity between incoming error and all candidates.
-    Uses Gemini embeddings if available, falls back to TF-IDF.
+    Calculate text similarity between incoming error and all candidates using TF-IDF.
     """
     if not candidate_texts:
         return []
     
-    # Try semantic embeddings first
-    if USE_SEMANTIC_EMBEDDINGS:
-        all_texts = [incoming_text] + candidate_texts
-        embeddings = get_gemini_embeddings(all_texts)
-        
-        if embeddings and len(embeddings) == len(all_texts):
-            incoming_embedding = embeddings[0]
-            candidate_embeddings = embeddings[1:]
-            
-            similarities = [
-                cosine_similarity_vectors(incoming_embedding, ce)
-                for ce in candidate_embeddings
-            ]
-            return similarities
-    
-    # Fallback to TF-IDF
     corpus = [incoming_text or ""] + [t or "" for t in candidate_texts]
     try:
         vectorizer = TfidfVectorizer(ngram_range=(1, 2), stop_words="english", min_df=1, max_df=0.95)
@@ -1179,10 +1103,6 @@ def run_pipeline(incoming_raw, candidates_raw):
             incoming_message, 
             candidate_messages
         )
-        
-        # Log which method was used
-        method_used = "Gemini embeddings" if USE_SEMANTIC_EMBEDDINGS else "TF-IDF"
-        print(f"Using {method_used} for message similarity", file=sys.stderr)
     else:
         message_similarities = []
     
@@ -1225,7 +1145,7 @@ def run_pipeline(incoming_raw, candidates_raw):
     
     # Add metadata about matching method
     report['metadata'] = {
-        'similarity_method': 'semantic_embeddings' if USE_SEMANTIC_EMBEDDINGS else 'tfidf',
+        'similarity_method': 'tfidf',
         'incoming_frame_quality': incoming_frame_quality,
         'generic_stack_detected': has_generic_stack
     }
