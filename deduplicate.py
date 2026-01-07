@@ -1020,7 +1020,10 @@ def analyze_frequency_trends(incoming: Dict, candidates: List[Dict], related_ent
     # Affected users (extract from error messages or user fields)
     affected_users = set()
     for error in similar_errors:
-        msg = error.get('error_message', '')
+        # If the key exists but the value is null/None, .get() returns None.
+        msg = error.get('error_message') or ''
+        if not isinstance(msg, (str, bytes)):
+            msg = str(msg)
         # Extract email patterns
         emails = re.findall(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b', msg)
         affected_users.update(emails)

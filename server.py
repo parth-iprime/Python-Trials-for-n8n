@@ -3,15 +3,25 @@ import deduplicate
 import sys
 import traceback
 import os
+import json
 
 app = Flask(__name__)
 
 @app.route('/deduplicate', methods=['POST'])
 def deduplicate_endpoint():
     try:
-        data = request.get_json()
+        # silent=True prevents Flask from raising a BadRequest exception on invalid JSON.
+        data = request.get_json(silent=True)
+
+        # Some clients (e.g., misconfigured n8n HTTP nodes) send a JSON *string*
+        # instead of a JSON object. Accept it to avoid 500s.
+        if isinstance(data, str):
+            try:
+                data = json.loads(data)
+            except json.JSONDecodeError:
+                return jsonify({"error": "Invalid JSON payload (string could not be parsed)"}), 400
         
-        if not data:
+        if not data or not isinstance(data, dict):
             return jsonify({"error": "No JSON data provided"}), 400
             
         incoming = data.get("incoming")
